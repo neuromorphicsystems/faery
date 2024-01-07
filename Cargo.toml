@@ -1,0 +1,19 @@
+[package]
+name = "python"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "faery"
+crate-type = ["cdylib"]
+
+[dependencies]
+flatbuffers = "22.10.26"
+lz4 = "1.24.0"
+ndarray = "0.15.6"
+neuromorphic-types = "0.4.0"
+numpy = "0.20.0"
+pyo3 = {version = "0.20.1", features = ["extension-module"]}
+roxmltree = "0.19.0"
+thiserror = "1.0"
+zstd = "0.13.0"

@@ -1,0 +1,35 @@
+[project]
+name = "faery"
+description = "Flexible AER librarY"
+readme = "README.md"
+license = {file = "LICENSE"}
+authors = [
+    {name = "International Centre for Neuromorphic Systems"},
+    {name = "Alexandre Marcireau"},
+]
+version = "0.1.0"
+requires-python = ">=3.8"
+dependencies = ["numpy>=1.24"]
+
+[project.urls]
+homepage = "https://github.com/neuromorphicsystems/faery/"
+repository = "https://github.com/neuromorphicsystems/faery/"
+documentation = "https://github.com/neuromorphicsystems/faery/"
+
+[build-system]
+requires = ["maturin==1.4.0", "numpy"]
+build-backend = "maturin"
+
+[tool.maturin]
+python-source = "python"
+
+[tool.pyright]
+typeCheckingMode = "basic"
+executionEnvironments = [{root = ".", venv = ".venv"}]
+
+[tool.isort]
+profile = "black"
+
+[project.scripts]
+neuromorphic-drivers-install-udev-rules = "neuromorphic_drivers:install_udev_rules_program"
+ndls = "neuromorphic_drivers:print_device_list"
