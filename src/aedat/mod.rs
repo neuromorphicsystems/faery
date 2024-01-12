@@ -7,80 +7,117 @@ use numpy::convert::ToPyArray;
 use numpy::Element;
 use pyo3::prelude::*;
 
-impl From<decoder::Error> for pyo3::PyErr {
+impl From<decoder::Error> for PyErr {
     fn from(error: decoder::Error) -> Self {
-        pyo3::PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(error.to_string())
+        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(error.to_string())
     }
 }
 
-impl From<decoder::PacketError> for pyo3::PyErr {
+impl From<decoder::PacketError> for PyErr {
     fn from(error: decoder::PacketError) -> Self {
-        pyo3::PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(error.to_string())
+        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(error.to_string())
     }
 }
 
 #[pyclass]
 pub struct Decoder {
-    decoder: decoder::Decoder,
+    decoder: Option<decoder::Decoder>,
 }
 
 #[pymethods]
 impl Decoder {
     #[new]
-    fn new(path: &pyo3::types::PyAny) -> Result<Self, pyo3::PyErr> {
-        pyo3::Python::with_gil(|python| -> Result<Self, pyo3::PyErr> {
+    fn new(path: &pyo3::types::PyAny) -> Result<Self, PyErr> {
+        Python::with_gil(|python| -> Result<Self, PyErr> {
             match utilities::python_path_to_string(python, path) {
                 Ok(result) => match decoder::Decoder::new(result) {
-                    Ok(result) => Ok(Decoder { decoder: result }),
-                    Err(error) => Err(pyo3::PyErr::from(error)),
+                    Ok(result) => Ok(Decoder {
+                        decoder: Some(result),
+                    }),
+                    Err(error) => Err(PyErr::from(error)),
                 },
                 Err(error) => Err(error),
             }
         })
     }
 
-    fn id_to_stream(&self, python: pyo3::prelude::Python) -> PyResult<PyObject> {
-        let python_id_to_stream = pyo3::types::PyDict::new(python);
-        for (id, stream) in self.decoder.id_to_stream.iter() {
-            let python_stream = pyo3::types::PyDict::new(python);
-            match stream.content {
-                decoder::StreamContent::Events => {
-                    python_stream.set_item("type", "events")?;
-                    python_stream.set_item("width", stream.width)?;
-                    python_stream.set_item("height", stream.height)?;
+    fn id_to_stream(&self, python: Python) -> PyResult<PyObject> {
+        match self.decoder {
+            Some(ref decoder) => {
+                let python_id_to_stream = pyo3::types::PyDict::new(python);
+                for (id, stream) in decoder.id_to_stream.iter() {
+                    let python_stream = pyo3::types::PyDict::new(python);
+                    match stream.content {
+                        decoder::StreamContent::Events => {
+                            python_stream.set_item("type", "events")?;
+                            python_stream.set_item("width", stream.width)?;
+                            python_stream.set_item("height", stream.height)?;
+                        }
+                        decoder::StreamContent::Frame => {
+                            python_stream.set_item("type", "frame")?;
+                            python_stream.set_item("width", stream.width)?;
+                            python_stream.set_item("height", stream.height)?;
+                        }
+                        decoder::StreamContent::Imus => python_stream.set_item("type", "imus")?,
+                        decoder::StreamContent::Triggers => {
+                            python_stream.set_item("type", "triggers")?
+                        }
+                    }
+                    python_id_to_stream.set_item(id, python_stream)?;
                 }
-                decoder::StreamContent::Frame => {
-                    python_stream.set_item("type", "frame")?;
-                    python_stream.set_item("width", stream.width)?;
-                    python_stream.set_item("height", stream.height)?;
-                }
-                decoder::StreamContent::Imus => python_stream.set_item("type", "imus")?,
-                decoder::StreamContent::Triggers => python_stream.set_item("type", "triggers")?,
+                Ok(python_id_to_stream.into())
             }
-            python_id_to_stream.set_item(id, python_stream)?;
+            None => Err(pyo3::exceptions::PyException::new_err(
+                "used decoder after __exit__",
+            )),
         }
-        Ok(python_id_to_stream.into())
     }
 
-    fn __iter__(shell: pyo3::PyRefMut<Self>) -> PyResult<pyo3::prelude::Py<Decoder>> {
+    fn __enter__(slf: Py<Self>) -> Py<Self> {
+        slf
+    }
+
+    fn __exit__(
+        &mut self,
+        _exception_type: Option<PyObject>,
+        _value: Option<PyObject>,
+        _traceback: Option<PyObject>,
+    ) -> PyResult<bool> {
+        if self.decoder.is_none() {
+            return Err(pyo3::exceptions::PyException::new_err(
+                "multiple calls to __exit__",
+            ));
+        }
+        let _ = self.decoder.take();
+        Ok(false)
+    }
+
+    fn __iter__(shell: PyRefMut<Self>) -> PyResult<Py<Decoder>> {
         Ok(shell.into())
     }
 
-    fn __next__(mut shell: pyo3::PyRefMut<Self>) -> PyResult<Option<PyObject>> {
-        let packet = match shell.decoder.next() {
-            Ok(result) => match result {
-                Some(result) => result,
-                None => return Ok(None),
+    fn __next__(mut shell: PyRefMut<Self>) -> PyResult<Option<PyObject>> {
+        let packet = match shell.decoder {
+            Some(ref mut decoder) => match decoder.next() {
+                Ok(result) => match result {
+                    Some(result) => result,
+                    None => return Ok(None),
+                },
+                Err(result) => return Err(result.into()),
             },
-            Err(result) => return Err(result.into()),
+            None => {
+                return Err(pyo3::exceptions::PyException::new_err(
+                    "used decoder after __exit__",
+                ))
+            }
         };
-        pyo3::Python::with_gil(|python| -> PyResult<Option<PyObject>> {
+        Python::with_gil(|python| -> PyResult<Option<PyObject>> {
             let python_packet = pyo3::types::PyDict::new(python);
             python_packet.set_item("stream_id", packet.stream_id)?;
             match packet.stream.content {
                 decoder::StreamContent::Events => {
                     let events = match decoder::events_generated::size_prefixed_root_as_event_packet(
-                        &packet.buffer,
+                        packet.buffer,
                     ) {
                         Ok(result) => match result.elements() {
                             Some(result) => result,
@@ -165,21 +202,23 @@ impl Decoder {
                                 }
                                 .into());
                             }
-                            *(event_cell.offset(0) as *mut u64) = event.t() as u64;
-                            *(event_cell.offset(8) as *mut u16) = event.x() as u16;
-                            *(event_cell.offset(10) as *mut u16) = event.y() as u16;
-                            *event_cell.offset(12) = if event.on() { 1 } else { 0 };
+                            let mut event_array = [0u8; 13];
+                            event_array[0..8].copy_from_slice(&(event.t() as u64).to_ne_bytes());
+                            event_array[8..10].copy_from_slice(&(event.x() as u16).to_ne_bytes());
+                            event_array[10..12].copy_from_slice(&(event.y() as u16).to_ne_bytes());
+                            event_array[12] = if event.on() { 1 } else { 0 };
+                            std::ptr::copy(event_array.as_ptr(), event_cell, event_array.len());
                         }
                         PyObject::from_owned_ptr(python, array)
                     })?;
                 }
                 decoder::StreamContent::Frame => {
                     let frame =
-                        match decoder::frame_generated::size_prefixed_root_as_frame(&packet.buffer)
+                        match decoder::frame_generated::size_prefixed_root_as_frame(packet.buffer)
                         {
                             Ok(result) => result,
                             Err(_) => {
-                                return Err(pyo3::PyErr::from(
+                                return Err(PyErr::from(
                                     decoder::PacketError::MissingPacketSizePrefix,
                                 ))
                             }
@@ -196,11 +235,7 @@ impl Decoder {
                             decoder::frame_generated::FrameFormat::Gray => "L",
                             decoder::frame_generated::FrameFormat::Bgr => "RGB",
                             decoder::frame_generated::FrameFormat::Bgra => "RGBA",
-                            _ => {
-                                return Err(pyo3::PyErr::from(
-                                    decoder::PacketError::UnknownFrameFormat,
-                                ))
-                            }
+                            _ => return Err(PyErr::from(decoder::PacketError::UnknownFrameFormat)),
                         },
                     )?;
                     python_frame.set_item("width", frame.width())?;
@@ -250,28 +285,22 @@ impl Decoder {
                                 },
                             )?;
                         }
-                        _ => {
-                            return Err(pyo3::PyErr::from(decoder::PacketError::UnknownFrameFormat))
-                        }
+                        _ => return Err(PyErr::from(decoder::PacketError::UnknownFrameFormat)),
                     }
                     python_packet.set_item("frame", python_frame)?;
                 }
                 decoder::StreamContent::Imus => {
                     let imus = match decoder::imus_generated::size_prefixed_root_as_imu_packet(
-                        &packet.buffer,
+                        packet.buffer,
                     ) {
                         Ok(result) => match result.elements() {
                             Some(result) => result,
                             None => {
-                                return Err(pyo3::PyErr::from(
-                                    decoder::PacketError::EmptyEventsPacket,
-                                ))
+                                return Err(PyErr::from(decoder::PacketError::EmptyEventsPacket))
                             }
                         },
                         Err(_) => {
-                            return Err(pyo3::PyErr::from(
-                                decoder::PacketError::MissingPacketSizePrefix,
-                            ))
+                            return Err(PyErr::from(decoder::PacketError::MissingPacketSizePrefix))
                         }
                     };
                     let mut length = imus.len() as numpy::npyffi::npy_intp;
@@ -384,17 +413,25 @@ impl Decoder {
                                 array as *mut numpy::npyffi::PyArrayObject,
                                 &mut index as *mut numpy::npyffi::npy_intp,
                             ) as *mut u8;
-                            *(imu_cell.offset(0) as *mut u64) = imu.t() as u64;
-                            *(imu_cell.offset(8) as *mut f32) = imu.temperature();
-                            *(imu_cell.offset(12) as *mut f32) = imu.accelerometer_x();
-                            *(imu_cell.offset(16) as *mut f32) = imu.accelerometer_y();
-                            *(imu_cell.offset(20) as *mut f32) = imu.accelerometer_z();
-                            *(imu_cell.offset(24) as *mut f32) = imu.gyroscope_x();
-                            *(imu_cell.offset(28) as *mut f32) = imu.gyroscope_y();
-                            *(imu_cell.offset(32) as *mut f32) = imu.gyroscope_z();
-                            *(imu_cell.offset(36) as *mut f32) = imu.magnetometer_x();
-                            *(imu_cell.offset(40) as *mut f32) = imu.magnetometer_y();
-                            *(imu_cell.offset(44) as *mut f32) = imu.magnetometer_z();
+                            let mut imu_array = [0u8; 48];
+                            imu_array[0..8].copy_from_slice(&(imu.t() as u64).to_ne_bytes());
+                            imu_array[8..12].copy_from_slice(&(imu.temperature()).to_ne_bytes());
+                            imu_array[12..16]
+                                .copy_from_slice(&(imu.accelerometer_x()).to_ne_bytes());
+                            imu_array[16..20]
+                                .copy_from_slice(&(imu.accelerometer_y()).to_ne_bytes());
+                            imu_array[20..24]
+                                .copy_from_slice(&(imu.accelerometer_z()).to_ne_bytes());
+                            imu_array[24..28].copy_from_slice(&(imu.gyroscope_x()).to_ne_bytes());
+                            imu_array[28..32].copy_from_slice(&(imu.gyroscope_y()).to_ne_bytes());
+                            imu_array[32..36].copy_from_slice(&(imu.gyroscope_z()).to_ne_bytes());
+                            imu_array[36..40]
+                                .copy_from_slice(&(imu.magnetometer_x()).to_ne_bytes());
+                            imu_array[40..44]
+                                .copy_from_slice(&(imu.magnetometer_y()).to_ne_bytes());
+                            imu_array[44..48]
+                                .copy_from_slice(&(imu.magnetometer_z()).to_ne_bytes());
+                            std::ptr::copy(imu_array.as_ptr(), imu_cell, imu_array.len());
                             index += 1_isize;
                         }
                         PyObject::from_owned_ptr(python, array)
@@ -403,18 +440,18 @@ impl Decoder {
                 decoder::StreamContent::Triggers => {
                     let triggers =
                         match decoder::triggers_generated::size_prefixed_root_as_trigger_packet(
-                            &packet.buffer,
+                            packet.buffer,
                         ) {
                             Ok(result) => match result.elements() {
                                 Some(result) => result,
                                 None => {
-                                    return Err(pyo3::PyErr::from(
+                                    return Err(PyErr::from(
                                         decoder::PacketError::EmptyEventsPacket,
                                     ))
                                 }
                             },
                             Err(_) => {
-                                return Err(pyo3::PyErr::from(
+                                return Err(PyErr::from(
                                     decoder::PacketError::MissingPacketSizePrefix,
                                 ))
                             }
@@ -466,28 +503,32 @@ impl Decoder {
                                 array as *mut numpy::npyffi::PyArrayObject,
                                 &mut index as *mut numpy::npyffi::npy_intp,
                             ) as *mut u8;
-                            *(trigger_cell.offset(0) as *mut u64) = trigger.t() as u64;
-                            *trigger_cell.offset(8) = match trigger.source() {
-                                decoder::triggers_generated::TriggerSource::TimestampReset => 0_u8,
-                                decoder::triggers_generated::TriggerSource::ExternalSignalRisingEdge => 1_u8,
-                                decoder::triggers_generated::TriggerSource::ExternalSignalFallingEdge => {
-                                    2_u8
-                                }
-                                decoder::triggers_generated::TriggerSource::ExternalSignalPulse => 3_u8,
-                                decoder::triggers_generated::TriggerSource::ExternalGeneratorRisingEdge => {
-                                    4_u8
-                                }
-                                decoder::triggers_generated::TriggerSource::ExternalGeneratorFallingEdge => {
-                                    5_u8
-                                }
-                                decoder::triggers_generated::TriggerSource::FrameBegin => 6_u8,
-                                decoder::triggers_generated::TriggerSource::FrameEnd => 7_u8,
-                                decoder::triggers_generated::TriggerSource::ExposureBegin => 8_u8,
-                                decoder::triggers_generated::TriggerSource::ExposureEnd => 9_u8,
+                            let mut trigger_array = [0u8; 9];
+                            trigger_array[0..8]
+                                .copy_from_slice(&(trigger.t() as u64).to_ne_bytes());
+                            use decoder::triggers_generated::TriggerSource;
+                            trigger_array[8] = match trigger.source() {
+                                TriggerSource::TimestampReset => 0_u8,
+                                TriggerSource::ExternalSignalRisingEdge => 1_u8,
+                                TriggerSource::ExternalSignalFallingEdge => 2_u8,
+                                TriggerSource::ExternalSignalPulse => 3_u8,
+                                TriggerSource::ExternalGeneratorRisingEdge => 4_u8,
+                                TriggerSource::ExternalGeneratorFallingEdge => 5_u8,
+                                TriggerSource::FrameBegin => 6_u8,
+                                TriggerSource::FrameEnd => 7_u8,
+                                TriggerSource::ExposureBegin => 8_u8,
+                                TriggerSource::ExposureEnd => 9_u8,
                                 _ => {
-                                    return Err(pyo3::PyErr::from(decoder::PacketError::UnknownTriggerSource))
+                                    return Err(PyErr::from(
+                                        decoder::PacketError::UnknownTriggerSource,
+                                    ))
                                 }
                             };
+                            std::ptr::copy(
+                                trigger_array.as_ptr(),
+                                trigger_cell,
+                                trigger_array.len(),
+                            );
                             index += 1_isize;
                         }
                         PyObject::from_owned_ptr(python, array)

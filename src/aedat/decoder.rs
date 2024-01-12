@@ -376,15 +376,12 @@ impl Decoder {
         if self.file_data_position > -1 && self.position == self.file_data_position {
             return Ok(None);
         }
-        let stream_id = {
-            let mut bytes = [0; 4];
+        let (stream_id, length) = {
+            let mut bytes = [0; 8];
             self.file.read_exact(&mut bytes)?;
-            u32::from_le_bytes(bytes)
-        };
-        let length = {
-            let mut bytes = [0; 4];
-            self.file.read_exact(&mut bytes)?;
-            u32::from_le_bytes(bytes)
+            let stream_id = u32::from_le_bytes(bytes[0..4].try_into().expect("four bytes"));
+            let length = u32::from_le_bytes(bytes[4..8].try_into().expect("four bytes"));
+            (stream_id, length)
         };
         self.position += 8i64 + length as i64;
         self.raw_buffer.resize(length as usize, 0u8);
@@ -395,10 +392,12 @@ impl Decoder {
             }
             ioheader_generated::Compression::Lz4 | ioheader_generated::Compression::Lz4High => {
                 let mut decoder = lz4::Decoder::new(&self.raw_buffer[..])?;
+                self.buffer.clear();
                 decoder.read_to_end(&mut self.buffer)?;
             }
             ioheader_generated::Compression::Zstd | ioheader_generated::Compression::ZstdHigh => {
                 let mut decoder = lz4::Decoder::new(&self.raw_buffer[..])?;
+                self.buffer.clear();
                 decoder.read_to_end(&mut self.buffer)?;
             }
             _ => return Err(PacketError::CompressionAlgorithm),
@@ -410,12 +409,19 @@ impl Decoder {
         let expected_content_string = stream.content.to_string();
         if !flatbuffers::buffer_has_identifier(&self.buffer, &expected_content_string, true) {
             let expected_length = expected_content_string.len();
+            let offset = flatbuffers::SIZE_SIZEPREFIX + flatbuffers::SIZE_UOFFSET;
             return Err(PacketError::BadPacketPrefix {
                 id: stream_id,
                 expected: expected_content_string,
-                got: String::from_utf8_lossy(
-                    &self.buffer[0..expected_length.min(self.buffer.len())],
-                )
+                got: if self.buffer.len() >= offset {
+                    String::from_utf8_lossy(
+                        &self.buffer
+                            [offset..offset + expected_length.min(self.buffer.len() - offset)],
+                    )
+                    .into_owned()
+                } else {
+                    "".to_owned()
+                }
                 .to_string(),
             });
         }

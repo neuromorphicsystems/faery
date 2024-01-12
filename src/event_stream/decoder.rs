@@ -1,10 +1,12 @@
 use std::io::Read;
 
+use crate::utilities;
+
 const MAGIC_NUMBER: &str = "Event Stream";
 const VERSION: [u8; 3] = [2, 0, 0];
-const BUFFER_SIZE: usize = 65536;
 
 #[repr(u8)]
+#[derive(Debug, Clone, Copy)]
 pub enum Type {
     Generic = 0,
     Dvs = 1,
@@ -96,7 +98,7 @@ enum State {
 
 pub struct Decoder {
     pub version: [u8; 3],
-    pub event_stream_type: Type,
+    pub event_type: Type,
     pub width: Option<u16>,
     pub height: Option<u16>,
     file: std::fs::File,
@@ -139,7 +141,7 @@ impl Decoder {
                 patch: version[2],
             });
         }
-        let event_stream_type = {
+        let event_type = {
             let mut version_byte = [0u8; 1];
             file.read_exact(&mut version_byte)?;
             match version_byte[0] {
@@ -150,7 +152,7 @@ impl Decoder {
                 _ => return Err(Error::UnsupportedType(version_byte[0])),
             }
         };
-        let (width, height) = match event_stream_type {
+        let (width, height) = match event_type {
             Type::Generic => (None, None),
             _ => {
                 let mut size_bytes = [0u8; 4];
@@ -163,12 +165,12 @@ impl Decoder {
         };
         Ok(Decoder {
             version: [0u8; 3],
-            event_stream_type: Type::Generic,
+            event_type,
             width,
             height,
             file,
-            raw_buffer: vec![0u8; BUFFER_SIZE],
-            state: match event_stream_type {
+            raw_buffer: vec![0u8; utilities::BUFFER_SIZE],
+            state: match event_type {
                 Type::Generic => State::Generic {
                     inner: GenericState::Idle,
                     t: 0,
@@ -263,6 +265,8 @@ impl Decoder {
                                 GenericState::Idle
                             } else if *byte != 0b11111110 {
                                 *t += *byte as u64;
+                                *bytes_length = 0;
+                                *index = 0;
                                 GenericState::Byte0
                             } else {
                                 GenericState::Idle
@@ -370,7 +374,7 @@ impl Decoder {
                     *inner = match inner {
                         AtisState::Idle => {
                             if (byte & 0b11111100) == 0b11111100 {
-                                event.t += (0b111111 as u64) * (byte & 0b11) as u64;
+                                event.t += (0b111111_u64) * (byte & 0b11) as u64;
                                 AtisState::Idle
                             } else {
                                 event.t += (byte >> 2) as u64;

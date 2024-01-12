@@ -1,3 +1,4 @@
 target
 *.so
 .venv
+__pycache__

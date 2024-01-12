@@ -8,7 +8,7 @@ import typing
 import numpy
 
 DVS_DTYPE: numpy.dtype = numpy.dtype(
-    [("t", "<u8"), ("x", "<u2"), ("y", "<u2"), ("p", "<u1")]
+    [("t", "<u8"), ("x", "<u2"), ("y", "<u2"), ("on", "?")]
 )
 
 
@@ -55,6 +55,9 @@ class Stream:
         raise NotImplementedError()
 
     def height(self) -> int:
+        raise NotImplementedError()
+
+    def time_range(self) -> tuple[int, int]:
         raise NotImplementedError()
 
     def __iter__(self) -> StreamIterator:
@@ -119,11 +122,25 @@ class ArrayIterator(StreamIterator):
 
 
 class Array(Stream):
-    def __init__(self, events: numpy.ndarray):
+    def __init__(self, events: numpy.ndarray, width: int, height: int):
+        assert self.events.dtype == DVS_DTYPE
         self.events = events
+        self.inner_width = width
+        self.inner_height = height
 
     def __iter__(self) -> StreamIterator:
         return ArrayIterator(self.events.copy())
+
+    def width(self) -> int:
+        return self.inner_width
+
+    def height(self) -> int:
+        return self.inner_height
+
+    def time_range(self) -> tuple[int, int]:
+        if len(self.events) == 0:
+            return (0, 1)
+        return (int(self.events["t"][0]), int(self.events["t"][-1]) + 1)
 
 
 class FilterIterator(StreamIterator):
@@ -144,3 +161,6 @@ class Filter(Stream):
 
     def height(self) -> int:
         return self.parent.height()
+
+    def time_range(self) -> tuple[int, int]:
+        return self.parent.time_range()
