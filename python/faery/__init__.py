@@ -25,8 +25,8 @@ def stream_from_file(
     path: typing.Union[str, pathlib.Path],
     stream_id: typing.Optional[int] = None,
     size_fallback: tuple[int, int] = (1280, 720),
-    version_fallback: str | None = None,
-    file_type: decoder.FileType | None = None,
+    version_fallback: typing.Optional[str] = None,
+    file_type: typing.Optional[decoder.FileType] = None,
 ) -> Stream:
     if isinstance(path, str):
         path = pathlib.Path(path)
