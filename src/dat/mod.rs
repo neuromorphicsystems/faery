@@ -1,9 +1,22 @@
+mod common;
 mod decoder;
+mod encoder;
 
-use crate::utilities;
+use crate::types;
 
-use numpy::Element;
 use pyo3::prelude::*;
+
+impl From<common::Error> for PyErr {
+    fn from(error: common::Error) -> Self {
+        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(error.to_string())
+    }
+}
+
+impl From<common::TypeError> for PyErr {
+    fn from(error: common::TypeError) -> Self {
+        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(error.to_string())
+    }
+}
 
 impl From<decoder::Error> for PyErr {
     fn from(error: decoder::Error) -> Self {
@@ -11,36 +24,42 @@ impl From<decoder::Error> for PyErr {
     }
 }
 
-impl From<decoder::PacketError> for PyErr {
-    fn from(error: decoder::PacketError) -> Self {
+impl From<encoder::Error> for PyErr {
+    fn from(error: encoder::Error) -> Self {
+        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(error.to_string())
+    }
+}
+
+impl From<encoder::PacketError> for PyErr {
+    fn from(error: encoder::PacketError) -> Self {
         PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(error.to_string())
     }
 }
 
 #[pyclass]
 pub struct Decoder {
-    decoder: Option<decoder::Decoder>,
+    inner: Option<decoder::Decoder>,
 }
 
 #[pymethods]
 impl Decoder {
     #[new]
     fn new(
-        path: &pyo3::types::PyAny,
-        size_fallback: Option<(u16, u16)>,
+        path: &pyo3::Bound<'_, pyo3::types::PyAny>,
+        dimensions_fallback: Option<(u16, u16)>,
         version_fallback: Option<String>,
     ) -> Result<Self, PyErr> {
         Python::with_gil(|python| -> Result<Self, PyErr> {
-            match utilities::python_path_to_string(python, path) {
+            match types::python_path_to_string(python, path) {
                 Ok(result) => match decoder::Decoder::new(
                     result,
-                    size_fallback,
+                    dimensions_fallback,
                     version_fallback
-                        .map(|version| decoder::Version::from_string(&version))
+                        .map(|version| common::Version::from_string(&version))
                         .transpose()?,
                 ) {
                     Ok(result) => Ok(Decoder {
-                        decoder: Some(result),
+                        inner: Some(result),
                     }),
                     Err(error) => Err(PyErr::from(error)),
                 },
@@ -50,36 +69,31 @@ impl Decoder {
     }
 
     #[getter]
+    fn version(&self) -> PyResult<String> {
+        match self.inner {
+            Some(ref decoder) => Ok(decoder.version().to_string().to_owned()),
+            None => Err(pyo3::exceptions::PyException::new_err(
+                "called version after __exit__",
+            )),
+        }
+    }
+
+    #[getter]
     fn event_type(&self) -> PyResult<String> {
-        match self.decoder {
-            Some(ref decoder) => Ok(match decoder.event_type {
-                decoder::Type::Event2d => "2d",
-                decoder::Type::EventCd => "dvs",
-                decoder::Type::EventExtTrigger => "trigger",
-            }
-            .to_owned()),
+        match self.inner {
+            Some(ref decoder) => Ok(decoder.event_type.to_string().to_owned()),
             None => Err(pyo3::exceptions::PyException::new_err(
-                "used decoder after __exit__",
+                "called event_type after __exit__",
             )),
         }
     }
 
     #[getter]
-    fn width(&self) -> PyResult<u16> {
-        match self.decoder {
-            Some(ref decoder) => Ok(decoder.width),
+    fn dimensions(&self) -> PyResult<Option<(u16, u16)>> {
+        match self.inner {
+            Some(ref decoder) => Ok(decoder.dimensions()),
             None => Err(pyo3::exceptions::PyException::new_err(
-                "used decoder after __exit__",
-            )),
-        }
-    }
-
-    #[getter]
-    fn height(&self) -> PyResult<u16> {
-        match self.decoder {
-            Some(ref decoder) => Ok(decoder.height),
-            None => Err(pyo3::exceptions::PyException::new_err(
-                "used decoder after __exit__",
+                "called dimensions after __exit__",
             )),
         }
     }
@@ -94,12 +108,12 @@ impl Decoder {
         _value: Option<PyObject>,
         _traceback: Option<PyObject>,
     ) -> PyResult<bool> {
-        if self.decoder.is_none() {
+        if self.inner.is_none() {
             return Err(pyo3::exceptions::PyException::new_err(
                 "multiple calls to __exit__",
             ));
         }
-        let _ = self.decoder.take();
+        let _ = self.inner.take();
         Ok(false)
     }
 
@@ -108,7 +122,7 @@ impl Decoder {
     }
 
     fn __next__(mut shell: PyRefMut<Self>) -> PyResult<Option<PyObject>> {
-        let packet = match shell.decoder {
+        let packet = match shell.inner {
             Some(ref mut decoder) => match decoder.next() {
                 Ok(result) => match result {
                     Some(result) => result,
@@ -118,72 +132,109 @@ impl Decoder {
             },
             None => {
                 return Err(pyo3::exceptions::PyException::new_err(
-                    "used decoder after __exit__",
+                    "called __next__ after __exit__",
                 ))
             }
         };
         Python::with_gil(|python| -> PyResult<Option<PyObject>> {
-            let mut length = packet.len() as numpy::npyffi::npy_intp;
+            let length = packet.len() as numpy::npyffi::npy_intp;
+            let array = types::ArrayType::Dat.new_array(python, length);
             unsafe {
-                let dtype_as_list = pyo3::ffi::PyList_New(4_isize);
-                utilities::set_dtype_as_list_field(
-                    python,
-                    dtype_as_list,
-                    0,
-                    "t",
-                    u64::get_dtype(python).num(),
-                );
-                utilities::set_dtype_as_list_field(
-                    python,
-                    dtype_as_list,
-                    1,
-                    "x",
-                    u16::get_dtype(python).num(),
-                );
-                utilities::set_dtype_as_list_field(
-                    python,
-                    dtype_as_list,
-                    2,
-                    "y",
-                    u16::get_dtype(python).num(),
-                );
-                utilities::set_dtype_as_list_field(
-                    python,
-                    dtype_as_list,
-                    3,
-                    "payload",
-                    u8::get_dtype(python).num(),
-                );
-                let mut dtype: *mut numpy::npyffi::PyArray_Descr = std::ptr::null_mut();
-                if numpy::PY_ARRAY_API.PyArray_DescrConverter(python, dtype_as_list, &mut dtype) < 0
-                {
-                    panic!("PyArray_DescrConverter failed");
-                }
-                let array = numpy::PY_ARRAY_API.PyArray_NewFromDescr(
-                    python,
-                    numpy::PY_ARRAY_API
-                        .get_type_object(python, numpy::npyffi::array::NpyTypes::PyArray_Type),
-                    dtype,
-                    1_i32,
-                    &mut length as *mut numpy::npyffi::npy_intp,
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    0_i32,
-                    std::ptr::null_mut(),
-                );
-                for mut index in 0_isize..length {
-                    let event_cell = numpy::PY_ARRAY_API.PyArray_GetPtr(
-                        python,
-                        array as *mut numpy::npyffi::PyArrayObject,
-                        &mut index as *mut numpy::npyffi::npy_intp,
-                    ) as *mut u8;
+                for index in 0..length {
+                    let event_cell = types::array_at(python, array, index);
                     std::ptr::copy(
-                        &packet[index as usize] as *const decoder::Event as *const u8,
+                        &packet[index as usize] as *const common::Event as *const u8,
                         event_cell,
-                        std::mem::size_of::<decoder::Event>(),
+                        std::mem::size_of::<common::Event>(),
                     );
                 }
-                Ok(Some(PyObject::from_owned_ptr(python, array)))
+                Ok(Some(PyObject::from_owned_ptr(
+                    python,
+                    array as *mut pyo3::ffi::PyObject,
+                )))
+            }
+        })
+    }
+}
+
+#[pyclass]
+pub struct Encoder {
+    inner: Option<encoder::Encoder>,
+}
+
+#[pymethods]
+impl Encoder {
+    #[new]
+    fn new(
+        path: &pyo3::Bound<'_, pyo3::types::PyAny>,
+        version: &str,
+        event_type: &str,
+        zero_t0: bool,
+        dimensions: Option<(u16, u16)>,
+    ) -> Result<Self, PyErr> {
+        Python::with_gil(|python| -> Result<Self, PyErr> {
+            match types::python_path_to_string(python, path) {
+                Ok(result) => match encoder::Encoder::new(
+                    result,
+                    common::Version::from_string(version)?,
+                    zero_t0,
+                    common::Type::new(event_type, dimensions)?,
+                ) {
+                    Ok(result) => Ok(Encoder {
+                        inner: Some(result),
+                    }),
+                    Err(error) => Err(PyErr::from(error)),
+                },
+                Err(error) => Err(error),
+            }
+        })
+    }
+
+    fn __enter__(slf: Py<Self>) -> Py<Self> {
+        slf
+    }
+
+    fn __exit__(
+        &mut self,
+        _exception_type: Option<PyObject>,
+        _value: Option<PyObject>,
+        _traceback: Option<PyObject>,
+    ) -> PyResult<bool> {
+        if self.inner.is_none() {
+            return Err(pyo3::exceptions::PyException::new_err(
+                "multiple calls to __exit__",
+            ));
+        }
+        let _ = self.inner.take();
+        Ok(false)
+    }
+
+    fn t0(&mut self) -> PyResult<Option<u64>> {
+        match &self.inner {
+            Some(encoder) => Ok(encoder.t0()),
+            None => Err(pyo3::exceptions::PyException::new_err(
+                "t0 called after __exit__",
+            )),
+        }
+    }
+
+    fn write(&mut self, packet: &pyo3::Bound<'_, pyo3::types::PyAny>) -> PyResult<()> {
+        Python::with_gil(|python| -> PyResult<()> {
+            match self.inner.as_mut() {
+                Some(encoder) => {
+                    let (array, length) =
+                        types::check_array(python, types::ArrayType::Dat, packet)?;
+                    unsafe {
+                        for index in 0..length {
+                            let event_cell = types::array_at(python, array, index);
+                            encoder.write(*event_cell)?;
+                        }
+                    }
+                    Ok(())
+                }
+                None => Err(pyo3::exceptions::PyException::new_err(
+                    "write called after __exit__",
+                )),
             }
         })
     }

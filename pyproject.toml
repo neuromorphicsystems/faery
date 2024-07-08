@@ -17,7 +17,7 @@ repository = "https://github.com/neuromorphicsystems/faery/"
 documentation = "https://github.com/neuromorphicsystems/faery/"
 
 [build-system]
-requires = ["maturin==1.4.0", "numpy"]
+requires = ["maturin==1.6.0", "numpy"]
 build-backend = "maturin"
 
 [tool.maturin]
@@ -29,7 +29,3 @@ executionEnvironments = [{root = ".", venv = ".venv"}]
 
 [tool.isort]
 profile = "black"
-
-[project.scripts]
-neuromorphic-drivers-install-udev-rules = "neuromorphic_drivers:install_udev_rules_program"
-ndls = "neuromorphic_drivers:print_device_list"

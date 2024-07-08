@@ -1,10 +1,13 @@
+mod common;
 mod decoder;
+mod encoder;
 
+use crate::types;
 use crate::utilities;
 
 use ndarray::IntoDimension;
 use numpy::convert::ToPyArray;
-use numpy::Element;
+use numpy::prelude::*;
 use pyo3::prelude::*;
 
 impl From<decoder::Error> for PyErr {
@@ -13,26 +16,136 @@ impl From<decoder::Error> for PyErr {
     }
 }
 
-impl From<decoder::PacketError> for PyErr {
-    fn from(error: decoder::PacketError) -> Self {
+impl From<decoder::ReadError> for PyErr {
+    fn from(error: decoder::ReadError) -> Self {
+        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(error.to_string())
+    }
+}
+
+impl From<encoder::Error> for PyErr {
+    fn from(error: encoder::Error) -> Self {
+        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(error.to_string())
+    }
+}
+
+impl From<encoder::CompressionError> for PyErr {
+    fn from(error: encoder::CompressionError) -> Self {
+        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(error.to_string())
+    }
+}
+
+impl From<encoder::PacketError> for PyErr {
+    fn from(error: encoder::PacketError) -> Self {
+        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(error.to_string())
+    }
+}
+
+impl From<common::Error> for PyErr {
+    fn from(error: common::Error) -> Self {
+        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(error.to_string())
+    }
+}
+
+impl From<common::DescriptionError> for PyErr {
+    fn from(error: common::DescriptionError) -> Self {
         PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(error.to_string())
     }
 }
 
 #[pyclass]
+#[derive(FromPyObject)]
+pub struct Track {
+    #[pyo3(get, set)]
+    pub id: u32,
+    #[pyo3(get, set)]
+    pub data_type: String,
+    #[pyo3(get, set)]
+    pub dimensions: Option<(u16, u16)>,
+}
+
+#[pymethods]
+impl Track {
+    #[new]
+    fn new(id: u32, data_type: String, dimensions: Option<(u16, u16)>) -> Self {
+        Self {
+            id,
+            data_type,
+            dimensions,
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "faery.aedat.Track(id={}, data_type=\"{}\", dimensions={})",
+            self.id,
+            self.data_type,
+            match self.dimensions {
+                Some(dimensions) => format!("({}, {})", dimensions.0, dimensions.1),
+                None => "None".to_owned(),
+            }
+        )
+    }
+}
+
+#[pyclass]
+pub struct Frame {
+    #[pyo3(get)]
+    t: u64,
+    #[pyo3(get)]
+    begin_t: i64,
+    #[pyo3(get)]
+    end_t: i64,
+    #[pyo3(get)]
+    exposure_begin_t: i64,
+    #[pyo3(get)]
+    exposure_end_t: i64,
+    #[pyo3(get)]
+    format: String,
+    #[pyo3(get)]
+    offset_x: i16,
+    #[pyo3(get)]
+    offset_y: i16,
+    #[pyo3(get)]
+    pixels: PyObject,
+}
+
+#[pymethods]
+impl Frame {
+    fn __repr__(&self) -> String {
+        Python::with_gil(|python| -> String {
+            format!(
+                "faery.aedat.Frame(t={}, begin_t={}, end_t={}, exposure_begin_t={}, exposure_end_t={}, format=\"{}\", offset_x={}, offset_y={}, pixels={})",
+                self.t,
+                self.begin_t,
+                self.end_t,
+                self.exposure_begin_t,
+                self.exposure_end_t,
+                self.format,
+                self.offset_x,
+                self.offset_y,
+                self.pixels.bind(python).repr().map_or_else(
+                    |error| error.to_string(),
+                    |representation| representation.to_string()
+                ),
+            )
+        })
+    }
+}
+
+#[pyclass]
 pub struct Decoder {
-    decoder: Option<decoder::Decoder>,
+    inner: Option<decoder::Decoder>,
 }
 
 #[pymethods]
 impl Decoder {
     #[new]
-    fn new(path: &pyo3::types::PyAny) -> Result<Self, PyErr> {
+    fn new(path: &pyo3::Bound<'_, pyo3::types::PyAny>) -> Result<Self, PyErr> {
         Python::with_gil(|python| -> Result<Self, PyErr> {
-            match utilities::python_path_to_string(python, path) {
+            match types::python_path_to_string(python, path) {
                 Ok(result) => match decoder::Decoder::new(result) {
                     Ok(result) => Ok(Decoder {
-                        decoder: Some(result),
+                        inner: Some(result),
                     }),
                     Err(error) => Err(PyErr::from(error)),
                 },
@@ -41,34 +154,32 @@ impl Decoder {
         })
     }
 
-    fn id_to_stream(&self, python: Python) -> PyResult<PyObject> {
-        match self.decoder {
+    fn tracks(&self) -> PyResult<Vec<Track>> {
+        match self.inner {
             Some(ref decoder) => {
-                let python_id_to_stream = pyo3::types::PyDict::new(python);
-                for (id, stream) in decoder.id_to_stream.iter() {
-                    let python_stream = pyo3::types::PyDict::new(python);
-                    match stream.content {
-                        decoder::StreamContent::Events => {
-                            python_stream.set_item("type", "events")?;
-                            python_stream.set_item("width", stream.width)?;
-                            python_stream.set_item("height", stream.height)?;
-                        }
-                        decoder::StreamContent::Frame => {
-                            python_stream.set_item("type", "frame")?;
-                            python_stream.set_item("width", stream.width)?;
-                            python_stream.set_item("height", stream.height)?;
-                        }
-                        decoder::StreamContent::Imus => python_stream.set_item("type", "imus")?,
-                        decoder::StreamContent::Triggers => {
-                            python_stream.set_item("type", "triggers")?
-                        }
-                    }
-                    python_id_to_stream.set_item(id, python_stream)?;
-                }
-                Ok(python_id_to_stream.into())
+                let mut tracks: Vec<Track> = decoder
+                    .id_to_track
+                    .iter()
+                    .map(|(id, track)| Track {
+                        id: *id,
+                        data_type: track.to_data_type().to_owned(),
+                        dimensions: track.dimensions(),
+                    })
+                    .collect();
+                tracks.sort_by_key(|track| track.id);
+                Ok(tracks)
             }
             None => Err(pyo3::exceptions::PyException::new_err(
-                "used decoder after __exit__",
+                "id_to_track called after __exit__",
+            )),
+        }
+    }
+
+    fn description(&self) -> PyResult<&str> {
+        match self.inner {
+            Some(ref decoder) => Ok(decoder.description()),
+            None => Err(pyo3::exceptions::PyException::new_err(
+                "document called after __exit__",
             )),
         }
     }
@@ -83,12 +194,12 @@ impl Decoder {
         _value: Option<PyObject>,
         _traceback: Option<PyObject>,
     ) -> PyResult<bool> {
-        if self.decoder.is_none() {
+        if self.inner.is_none() {
             return Err(pyo3::exceptions::PyException::new_err(
                 "multiple calls to __exit__",
             ));
         }
-        let _ = self.decoder.take();
+        let _ = self.inner.take();
         Ok(false)
     }
 
@@ -96,8 +207,8 @@ impl Decoder {
         Ok(shell.into())
     }
 
-    fn __next__(mut shell: PyRefMut<Self>) -> PyResult<Option<PyObject>> {
-        let packet = match shell.decoder {
+    fn __next__(mut shell: PyRefMut<Self>) -> PyResult<Option<(Track, PyObject)>> {
+        let packet = match shell.inner {
             Some(ref mut decoder) => match decoder.next() {
                 Ok(result) => match result {
                     Some(result) => result,
@@ -107,406 +218,213 @@ impl Decoder {
             },
             None => {
                 return Err(pyo3::exceptions::PyException::new_err(
-                    "used decoder after __exit__",
+                    "__next__ called after __exit__",
                 ))
             }
         };
-        Python::with_gil(|python| -> PyResult<Option<PyObject>> {
-            let python_packet = pyo3::types::PyDict::new(python);
-            python_packet.set_item("stream_id", packet.stream_id)?;
-            match packet.stream.content {
-                decoder::StreamContent::Events => {
-                    let events = match decoder::events_generated::size_prefixed_root_as_event_packet(
-                        packet.buffer,
-                    ) {
+        Python::with_gil(|python| -> PyResult<Option<(Track, PyObject)>> {
+            let track = Track {
+                id: packet.track_id,
+                data_type: packet.track.to_data_type().to_owned(),
+                dimensions: packet.track.dimensions(),
+            };
+            let packet = match packet.track {
+                common::Track::Events {
+                    dimensions,
+                    ref mut previous_t,
+                } => {
+                    use common::events_generated::size_prefixed_root_as_event_packet;
+                    let events = match size_prefixed_root_as_event_packet(packet.buffer) {
                         Ok(result) => match result.elements() {
                             Some(result) => result,
-                            None => return Err(decoder::PacketError::EmptyEventsPacket.into()),
+                            None => return Err(decoder::ReadError::EmptyEventsPacket.into()),
                         },
-                        Err(_) => return Err(decoder::PacketError::MissingPacketSizePrefix.into()),
+                        Err(_) => return Err(decoder::ReadError::MissingPacketSizePrefix.into()),
                     };
-                    let mut length = events.len() as numpy::npyffi::npy_intp;
-                    python_packet.set_item("events", unsafe {
-                        let dtype_as_list = pyo3::ffi::PyList_New(4_isize);
-                        utilities::set_dtype_as_list_field(
-                            python,
-                            dtype_as_list,
-                            0,
-                            "t",
-                            u64::get_dtype(python).num(),
-                        );
-                        utilities::set_dtype_as_list_field(
-                            python,
-                            dtype_as_list,
-                            1,
-                            "x",
-                            u16::get_dtype(python).num(),
-                        );
-                        utilities::set_dtype_as_list_field(
-                            python,
-                            dtype_as_list,
-                            2,
-                            "y",
-                            u16::get_dtype(python).num(),
-                        );
-                        utilities::set_dtype_as_list_field(
-                            python,
-                            dtype_as_list,
-                            3,
-                            "on",
-                            bool::get_dtype(python).num(),
-                        );
-                        let mut dtype: *mut numpy::npyffi::PyArray_Descr = std::ptr::null_mut();
-                        if numpy::PY_ARRAY_API.PyArray_DescrConverter(
-                            python,
-                            dtype_as_list,
-                            &mut dtype,
-                        ) < 0
-                        {
-                            panic!("PyArray_DescrConverter failed");
-                        }
-                        let array = numpy::PY_ARRAY_API.PyArray_NewFromDescr(
-                            python,
-                            numpy::PY_ARRAY_API.get_type_object(
-                                python,
-                                numpy::npyffi::array::NpyTypes::PyArray_Type,
-                            ),
-                            dtype,
-                            1_i32,
-                            &mut length as *mut numpy::npyffi::npy_intp,
-                            std::ptr::null_mut(),
-                            std::ptr::null_mut(),
-                            0_i32,
-                            std::ptr::null_mut(),
-                        );
-                        for mut index in 0_isize..length {
-                            let event_cell = numpy::PY_ARRAY_API.PyArray_GetPtr(
-                                python,
-                                array as *mut numpy::npyffi::PyArrayObject,
-                                &mut index as *mut numpy::npyffi::npy_intp,
-                            ) as *mut u8;
+                    let length = events.len() as numpy::npyffi::npy_intp;
+                    let array = types::ArrayType::Dvs.new_array(python, length);
+                    unsafe {
+                        for index in 0..length {
+                            let event_cell = types::array_at(python, array, index);
                             let event = events.get(index as usize);
+                            let t = event.t().max(*previous_t as i64) as u64;
+                            *previous_t = t;
                             let x = event.x();
                             let y = event.y();
-                            if x < 0 || x >= packet.stream.width as i16 {
-                                return Err(decoder::PacketError::XOverflow {
+                            if x < 0 || x >= dimensions.0 as i16 {
+                                return Err(decoder::ReadError::XOverflow {
                                     x,
-                                    width: packet.stream.width,
+                                    width: dimensions.0,
                                 }
                                 .into());
                             }
-                            if y < 0 || y >= packet.stream.height as i16 {
-                                return Err(decoder::PacketError::YOverflow {
+                            if y < 0 || y >= dimensions.1 as i16 {
+                                return Err(decoder::ReadError::YOverflow {
                                     y,
-                                    height: packet.stream.height,
+                                    height: dimensions.1,
                                 }
                                 .into());
                             }
                             let mut event_array = [0u8; 13];
-                            event_array[0..8].copy_from_slice(&(event.t() as u64).to_ne_bytes());
-                            event_array[8..10].copy_from_slice(&(event.x() as u16).to_ne_bytes());
-                            event_array[10..12].copy_from_slice(&(event.y() as u16).to_ne_bytes());
+                            event_array[0..8].copy_from_slice(&t.to_le_bytes());
+                            event_array[8..10].copy_from_slice(&(x as u16).to_le_bytes());
+                            event_array[10..12].copy_from_slice(&(y as u16).to_le_bytes());
                             event_array[12] = if event.on() { 1 } else { 0 };
                             std::ptr::copy(event_array.as_ptr(), event_cell, event_array.len());
                         }
-                        PyObject::from_owned_ptr(python, array)
-                    })?;
+                        PyObject::from_owned_ptr(python, array as *mut pyo3::ffi::PyObject)
+                    }
                 }
-                decoder::StreamContent::Frame => {
+                common::Track::Frame {
+                    ref mut previous_t, ..
+                } => {
                     let frame =
-                        match decoder::frame_generated::size_prefixed_root_as_frame(packet.buffer)
-                        {
+                        match common::frame_generated::size_prefixed_root_as_frame(packet.buffer) {
                             Ok(result) => result,
                             Err(_) => {
                                 return Err(PyErr::from(
-                                    decoder::PacketError::MissingPacketSizePrefix,
+                                    decoder::ReadError::MissingPacketSizePrefix,
                                 ))
                             }
                         };
-                    let python_frame = pyo3::types::PyDict::new(python);
-                    python_frame.set_item("t", frame.t())?;
-                    python_frame.set_item("begin_t", frame.begin_t())?;
-                    python_frame.set_item("end_t", frame.end_t())?;
-                    python_frame.set_item("exposure_begin_t", frame.exposure_begin_t())?;
-                    python_frame.set_item("exposure_end_t", frame.exposure_end_t())?;
-                    python_frame.set_item(
-                        "format",
-                        match frame.format() {
-                            decoder::frame_generated::FrameFormat::Gray => "L",
-                            decoder::frame_generated::FrameFormat::Bgr => "RGB",
-                            decoder::frame_generated::FrameFormat::Bgra => "RGBA",
-                            _ => return Err(PyErr::from(decoder::PacketError::UnknownFrameFormat)),
+                    let t = frame.t().max(*previous_t as i64) as u64;
+                    *previous_t = t;
+                    Frame {
+                        t,
+                        begin_t: frame.begin_t(),
+                        end_t: frame.end_t(),
+                        exposure_begin_t: frame.exposure_begin_t(),
+                        exposure_end_t: frame.exposure_end_t(),
+                        format: match frame.format() {
+                            common::frame_generated::FrameFormat::Gray => "L".to_owned(),
+                            common::frame_generated::FrameFormat::Bgr => "RGB".to_owned(),
+                            common::frame_generated::FrameFormat::Bgra => "RGBA".to_owned(),
+                            _ => return Err(PyErr::from(decoder::ReadError::UnknownFrameFormat)),
                         },
-                    )?;
-                    python_frame.set_item("width", frame.width())?;
-                    python_frame.set_item("height", frame.height())?;
-                    python_frame.set_item("offset_x", frame.offset_x())?;
-                    python_frame.set_item("offset_y", frame.offset_y())?;
-                    match frame.format() {
-                        decoder::frame_generated::FrameFormat::Gray => {
-                            let dimensions =
-                                [frame.height() as usize, frame.width() as usize].into_dimension();
-                            python_frame.set_item(
-                                "pixels",
+                        offset_x: frame.offset_x(),
+                        offset_y: frame.offset_y(),
+                        pixels: match frame.format() {
+                            common::frame_generated::FrameFormat::Gray => {
+                                let dimensions = [frame.height() as usize, frame.width() as usize]
+                                    .into_dimension();
                                 match frame.pixels() {
-                                    Some(result) => {
-                                        result.bytes().to_pyarray(python).reshape(dimensions)?
-                                    }
-                                    None => numpy::array::PyArray2::<u8>::zeros(
+                                    Some(result) => result
+                                        .bytes()
+                                        .to_pyarray_bound(python)
+                                        .reshape(dimensions)?
+                                        .to_object(python),
+                                    None => numpy::array::PyArray2::<u8>::zeros_bound(
                                         python, dimensions, false,
-                                    ),
-                                },
-                            )?;
-                        }
-                        decoder::frame_generated::FrameFormat::Bgr
-                        | decoder::frame_generated::FrameFormat::Bgra => {
-                            let channels =
-                                if frame.format() == decoder::frame_generated::FrameFormat::Bgr {
+                                    )
+                                    .to_object(python),
+                                }
+                            }
+                            common::frame_generated::FrameFormat::Bgr
+                            | common::frame_generated::FrameFormat::Bgra => {
+                                let channels = if frame.format()
+                                    == common::frame_generated::FrameFormat::Bgr
+                                {
                                     3_usize
                                 } else {
                                     4_usize
                                 };
-                            let dimensions =
-                                [frame.height() as usize, frame.width() as usize, channels]
-                                    .into_dimension();
-                            python_frame.set_item(
-                                "pixels",
+                                let dimensions =
+                                    [frame.height() as usize, frame.width() as usize, channels]
+                                        .into_dimension();
                                 match frame.pixels() {
                                     Some(result) => {
                                         let mut pixels = result.bytes().to_owned();
                                         for index in 0..(pixels.len() / channels) {
                                             pixels.swap(index * channels, index * channels + 2);
                                         }
-                                        pixels.to_pyarray(python).reshape(dimensions)?
+                                        pixels
+                                            .to_pyarray_bound(python)
+                                            .reshape(dimensions)?
+                                            .to_object(python)
                                     }
-                                    None => numpy::array::PyArray3::<u8>::zeros(
+                                    None => numpy::array::PyArray3::<u8>::zeros_bound(
                                         python, dimensions, false,
-                                    ),
-                                },
-                            )?;
-                        }
-                        _ => return Err(PyErr::from(decoder::PacketError::UnknownFrameFormat)),
+                                    )
+                                    .to_object(python),
+                                }
+                            }
+                            _ => return Err(PyErr::from(decoder::ReadError::UnknownFrameFormat)),
+                        },
                     }
-                    python_packet.set_item("frame", python_frame)?;
+                    .into_py(python)
                 }
-                decoder::StreamContent::Imus => {
-                    let imus = match decoder::imus_generated::size_prefixed_root_as_imu_packet(
+                common::Track::Imus { ref mut previous_t } => {
+                    let imus = match common::imus_generated::size_prefixed_root_as_imu_packet(
                         packet.buffer,
                     ) {
                         Ok(result) => match result.elements() {
                             Some(result) => result,
-                            None => {
-                                return Err(PyErr::from(decoder::PacketError::EmptyEventsPacket))
-                            }
+                            None => return Err(PyErr::from(decoder::ReadError::EmptyEventsPacket)),
                         },
-                        Err(_) => {
-                            return Err(PyErr::from(decoder::PacketError::MissingPacketSizePrefix))
+                        Err(error) => {
+                            return Err(PyErr::from(decoder::ReadError::MissingPacketSizePrefix));
                         }
                     };
-                    let mut length = imus.len() as numpy::npyffi::npy_intp;
-                    python_packet.set_item("imus", unsafe {
-                        let dtype_as_list = pyo3::ffi::PyList_New(11_isize);
-                        utilities::set_dtype_as_list_field(
-                            python,
-                            dtype_as_list,
-                            0,
-                            "t",
-                            u64::get_dtype(python).num(),
-                        );
-                        utilities::set_dtype_as_list_field(
-                            python,
-                            dtype_as_list,
-                            1,
-                            "temperature",
-                            f32::get_dtype(python).num(),
-                        );
-                        utilities::set_dtype_as_list_field(
-                            python,
-                            dtype_as_list,
-                            2,
-                            "accelerometer_x",
-                            f32::get_dtype(python).num(),
-                        );
-                        utilities::set_dtype_as_list_field(
-                            python,
-                            dtype_as_list,
-                            3,
-                            "accelerometer_y",
-                            f32::get_dtype(python).num(),
-                        );
-                        utilities::set_dtype_as_list_field(
-                            python,
-                            dtype_as_list,
-                            4,
-                            "accelerometer_z",
-                            f32::get_dtype(python).num(),
-                        );
-                        utilities::set_dtype_as_list_field(
-                            python,
-                            dtype_as_list,
-                            5,
-                            "gyroscope_x",
-                            f32::get_dtype(python).num(),
-                        );
-                        utilities::set_dtype_as_list_field(
-                            python,
-                            dtype_as_list,
-                            6,
-                            "gyroscope_y",
-                            f32::get_dtype(python).num(),
-                        );
-                        utilities::set_dtype_as_list_field(
-                            python,
-                            dtype_as_list,
-                            7,
-                            "gyroscope_z",
-                            f32::get_dtype(python).num(),
-                        );
-                        utilities::set_dtype_as_list_field(
-                            python,
-                            dtype_as_list,
-                            8,
-                            "magnetometer_x",
-                            f32::get_dtype(python).num(),
-                        );
-                        utilities::set_dtype_as_list_field(
-                            python,
-                            dtype_as_list,
-                            9,
-                            "magnetometer_y",
-                            f32::get_dtype(python).num(),
-                        );
-                        utilities::set_dtype_as_list_field(
-                            python,
-                            dtype_as_list,
-                            10,
-                            "magnetometer_z",
-                            f32::get_dtype(python).num(),
-                        );
-                        let mut dtype: *mut numpy::npyffi::PyArray_Descr = std::ptr::null_mut();
-                        if numpy::PY_ARRAY_API.PyArray_DescrConverter(
-                            python,
-                            dtype_as_list,
-                            &mut dtype,
-                        ) < 0
-                        {
-                            panic!("PyArray_DescrConverter failed");
-                        }
-                        let array = numpy::PY_ARRAY_API.PyArray_NewFromDescr(
-                            python,
-                            numpy::PY_ARRAY_API.get_type_object(
-                                python,
-                                numpy::npyffi::array::NpyTypes::PyArray_Type,
-                            ),
-                            dtype,
-                            1_i32,
-                            &mut length as *mut numpy::npyffi::npy_intp,
-                            std::ptr::null_mut(),
-                            std::ptr::null_mut(),
-                            0_i32,
-                            std::ptr::null_mut(),
-                        );
-                        let mut index = 0_isize;
+                    let length = imus.len() as numpy::npyffi::npy_intp;
+                    let array = types::ArrayType::AedatImu.new_array(python, length);
+                    unsafe {
+                        let mut index = 0;
                         for imu in imus {
-                            let imu_cell = numpy::PY_ARRAY_API.PyArray_GetPtr(
-                                python,
-                                array as *mut numpy::npyffi::PyArrayObject,
-                                &mut index as *mut numpy::npyffi::npy_intp,
-                            ) as *mut u8;
+                            let t = imu.t().max(*previous_t as i64) as u64;
+                            *previous_t = t;
+                            let imu_cell = types::array_at(python, array, index);
                             let mut imu_array = [0u8; 48];
-                            imu_array[0..8].copy_from_slice(&(imu.t() as u64).to_ne_bytes());
-                            imu_array[8..12].copy_from_slice(&(imu.temperature()).to_ne_bytes());
+                            imu_array[0..8].copy_from_slice(&t.to_le_bytes());
+                            imu_array[8..12].copy_from_slice(&(imu.temperature()).to_le_bytes());
                             imu_array[12..16]
-                                .copy_from_slice(&(imu.accelerometer_x()).to_ne_bytes());
+                                .copy_from_slice(&(imu.accelerometer_x()).to_le_bytes());
                             imu_array[16..20]
-                                .copy_from_slice(&(imu.accelerometer_y()).to_ne_bytes());
+                                .copy_from_slice(&(imu.accelerometer_y()).to_le_bytes());
                             imu_array[20..24]
-                                .copy_from_slice(&(imu.accelerometer_z()).to_ne_bytes());
-                            imu_array[24..28].copy_from_slice(&(imu.gyroscope_x()).to_ne_bytes());
-                            imu_array[28..32].copy_from_slice(&(imu.gyroscope_y()).to_ne_bytes());
-                            imu_array[32..36].copy_from_slice(&(imu.gyroscope_z()).to_ne_bytes());
+                                .copy_from_slice(&(imu.accelerometer_z()).to_le_bytes());
+                            imu_array[24..28].copy_from_slice(&(imu.gyroscope_x()).to_le_bytes());
+                            imu_array[28..32].copy_from_slice(&(imu.gyroscope_y()).to_le_bytes());
+                            imu_array[32..36].copy_from_slice(&(imu.gyroscope_z()).to_le_bytes());
                             imu_array[36..40]
-                                .copy_from_slice(&(imu.magnetometer_x()).to_ne_bytes());
+                                .copy_from_slice(&(imu.magnetometer_x()).to_le_bytes());
                             imu_array[40..44]
-                                .copy_from_slice(&(imu.magnetometer_y()).to_ne_bytes());
+                                .copy_from_slice(&(imu.magnetometer_y()).to_le_bytes());
                             imu_array[44..48]
-                                .copy_from_slice(&(imu.magnetometer_z()).to_ne_bytes());
+                                .copy_from_slice(&(imu.magnetometer_z()).to_le_bytes());
                             std::ptr::copy(imu_array.as_ptr(), imu_cell, imu_array.len());
-                            index += 1_isize;
+                            index += 1;
                         }
-                        PyObject::from_owned_ptr(python, array)
-                    })?;
+                        PyObject::from_owned_ptr(python, array as *mut pyo3::ffi::PyObject)
+                    }
                 }
-                decoder::StreamContent::Triggers => {
+                common::Track::Triggers { ref mut previous_t } => {
                     let triggers =
-                        match decoder::triggers_generated::size_prefixed_root_as_trigger_packet(
+                        match common::triggers_generated::size_prefixed_root_as_trigger_packet(
                             packet.buffer,
                         ) {
                             Ok(result) => match result.elements() {
                                 Some(result) => result,
                                 None => {
-                                    return Err(PyErr::from(
-                                        decoder::PacketError::EmptyEventsPacket,
-                                    ))
+                                    return Err(PyErr::from(decoder::ReadError::EmptyEventsPacket))
                                 }
                             },
                             Err(_) => {
                                 return Err(PyErr::from(
-                                    decoder::PacketError::MissingPacketSizePrefix,
+                                    decoder::ReadError::MissingPacketSizePrefix,
                                 ))
                             }
                         };
-                    let mut length = triggers.len() as numpy::npyffi::npy_intp;
-                    python_packet.set_item("triggers", unsafe {
-                        let dtype_as_list = pyo3::ffi::PyList_New(2_isize);
-                        utilities::set_dtype_as_list_field(
-                            python,
-                            dtype_as_list,
-                            0,
-                            "t",
-                            u64::get_dtype(python).num(),
-                        );
-                        utilities::set_dtype_as_list_field(
-                            python,
-                            dtype_as_list,
-                            1,
-                            "source",
-                            u8::get_dtype(python).num(),
-                        );
-                        let mut dtype: *mut numpy::npyffi::PyArray_Descr = std::ptr::null_mut();
-                        if numpy::PY_ARRAY_API.PyArray_DescrConverter(
-                            python,
-                            dtype_as_list,
-                            &mut dtype,
-                        ) < 0
-                        {
-                            panic!("PyArray_DescrConverter failed");
-                        }
-                        let array = numpy::PY_ARRAY_API.PyArray_NewFromDescr(
-                            python,
-                            numpy::PY_ARRAY_API.get_type_object(
-                                python,
-                                numpy::npyffi::array::NpyTypes::PyArray_Type,
-                            ),
-                            dtype,
-                            1_i32,
-                            &mut length as *mut numpy::npyffi::npy_intp,
-                            std::ptr::null_mut(),
-                            std::ptr::null_mut(),
-                            0_i32,
-                            std::ptr::null_mut(),
-                        );
-                        let mut index = 0_isize;
+                    let length = triggers.len() as numpy::npyffi::npy_intp;
+                    let array = types::ArrayType::AedatTrigger.new_array(python, length);
+                    unsafe {
+                        let mut index = 0;
                         for trigger in triggers {
-                            let trigger_cell = numpy::PY_ARRAY_API.PyArray_GetPtr(
-                                python,
-                                array as *mut numpy::npyffi::PyArrayObject,
-                                &mut index as *mut numpy::npyffi::npy_intp,
-                            ) as *mut u8;
+                            let t = trigger.t().max(*previous_t as i64) as u64;
+                            *previous_t = t;
+                            let trigger_cell = types::array_at(python, array, index);
                             let mut trigger_array = [0u8; 9];
-                            trigger_array[0..8]
-                                .copy_from_slice(&(trigger.t() as u64).to_ne_bytes());
-                            use decoder::triggers_generated::TriggerSource;
+                            trigger_array[0..8].copy_from_slice(&t.to_le_bytes());
+                            use common::triggers_generated::TriggerSource;
                             trigger_array[8] = match trigger.source() {
                                 TriggerSource::TimestampReset => 0_u8,
                                 TriggerSource::ExternalSignalRisingEdge => 1_u8,
@@ -520,7 +438,7 @@ impl Decoder {
                                 TriggerSource::ExposureEnd => 9_u8,
                                 _ => {
                                     return Err(PyErr::from(
-                                        decoder::PacketError::UnknownTriggerSource,
+                                        decoder::ReadError::UnknownTriggerSource,
                                     ))
                                 }
                             };
@@ -529,13 +447,338 @@ impl Decoder {
                                 trigger_cell,
                                 trigger_array.len(),
                             );
-                            index += 1_isize;
+                            index += 1;
                         }
-                        PyObject::from_owned_ptr(python, array)
-                    })?;
+                        PyObject::from_owned_ptr(python, array as *mut pyo3::ffi::PyObject)
+                    }
                 }
+            };
+            Ok(Some((track, packet)))
+        })
+    }
+}
+
+#[pyclass]
+pub struct Encoder {
+    inner: Option<encoder::Encoder>,
+    frame_buffer: Vec<u8>,
+}
+
+#[derive(FromPyObject)]
+enum DescriptionOrTracks {
+    Description(String),
+    Tracks(Vec<Track>),
+}
+
+#[pymethods]
+impl Encoder {
+    #[new]
+    fn new(
+        path: &pyo3::Bound<'_, pyo3::types::PyAny>,
+        description_or_tracks: DescriptionOrTracks,
+        compression: Option<(String, u8)>,
+    ) -> Result<Self, PyErr> {
+        Python::with_gil(|python| -> Result<Self, PyErr> {
+            match types::python_path_to_string(python, path) {
+                Ok(result) => match encoder::Encoder::new(
+                    result,
+                    match &description_or_tracks {
+                        DescriptionOrTracks::Description(description) => {
+                            encoder::DescriptionOrIdsAndTracks::Description(description.as_str())
+                        }
+                        DescriptionOrTracks::Tracks(tracks) => {
+                            encoder::DescriptionOrIdsAndTracks::IdsAndTracks({
+                                let ids_and_tracks: Result<
+                                    Vec<(u32, common::Track)>,
+                                    common::Error,
+                                > = tracks
+                                    .iter()
+                                    .map(|track| {
+                                        common::Track::from_data_type(
+                                            &track.data_type,
+                                            track.dimensions,
+                                        )
+                                        .map(|common_track| (track.id, common_track))
+                                    })
+                                    .collect();
+                                ids_and_tracks?
+                            })
+                        }
+                    },
+                    encoder::Compression::from_name_and_level(compression)?,
+                ) {
+                    Ok(result) => Ok(Encoder {
+                        inner: Some(result),
+                        frame_buffer: Vec::new(),
+                    }),
+                    Err(error) => Err(PyErr::from(error)),
+                },
+                Err(error) => Err(error),
             }
-            Ok(Some(python_packet.into()))
+        })
+    }
+
+    fn __enter__(slf: Py<Self>) -> Py<Self> {
+        slf
+    }
+
+    fn __exit__(
+        &mut self,
+        _exception_type: Option<PyObject>,
+        _value: Option<PyObject>,
+        _traceback: Option<PyObject>,
+    ) -> PyResult<bool> {
+        if self.inner.is_none() {
+            return Err(pyo3::exceptions::PyException::new_err(
+                "multiple calls to __exit__",
+            ));
+        }
+        let _ = self.inner.take();
+        Ok(false)
+    }
+
+    fn write(
+        &mut self,
+        track_id: u32,
+        packet: &pyo3::Bound<'_, pyo3::types::PyAny>,
+    ) -> PyResult<()> {
+        Python::with_gil(|python| -> PyResult<()> {
+            match self.inner.as_mut() {
+                Some(encoder) => match encoder.get_track(track_id) {
+                    Some(track) => {
+                        match track {
+                            common::Track::Events {
+                                dimensions,
+                                ref mut previous_t,
+                            } => {
+                                let (array, length) =
+                                    types::check_array(python, types::ArrayType::Dvs, packet)?;
+                                unsafe {
+                                    for index in 0..length {
+                                        let event_cell: *mut neuromorphic_types::DvsEvent<
+                                            u64,
+                                            u16,
+                                            u16,
+                                        > = types::array_at(python, array, index);
+                                        let event = *event_cell;
+                                        if event.t < *previous_t {
+                                            return Err(utilities::WriteError::NonMonotonic {
+                                                previous_t: *previous_t,
+                                                t: event.t,
+                                            }
+                                            .into());
+                                        }
+                                        if event.x >= dimensions.0 {
+                                            return Err(utilities::WriteError::XOverflow {
+                                                x: event.x,
+                                                width: dimensions.0,
+                                            }
+                                            .into());
+                                        }
+                                        if event.y >= dimensions.1 {
+                                            return Err(utilities::WriteError::YOverflow {
+                                                y: event.y,
+                                                height: dimensions.1,
+                                            }
+                                            .into());
+                                        }
+                                        *previous_t = event.t;
+                                    }
+                                }
+                                encoder.write_events(
+                                    track_id,
+                                    (0..length).into_iter().map(|index| unsafe {
+                                        *types::array_at(python, array, index)
+                                    }),
+                                )?;
+                            }
+                            common::Track::Frame {
+                                dimensions,
+                                ref mut previous_t,
+                            } => {
+                                let frame_bound: &pyo3::Bound<'_, Frame> = packet.downcast()?;
+                                let frame = frame_bound.borrow();
+                                if frame.t < *previous_t {
+                                    return Err(utilities::WriteError::NonMonotonic {
+                                        previous_t: *previous_t,
+                                        t: frame.t,
+                                    }
+                                    .into());
+                                }
+                                self.frame_buffer.clear();
+                                let (frame_format, frame_dimensions) = match frame.format.as_str() {
+                                    "L" => {
+                                        let array_bound = frame.pixels.downcast_bound::<numpy::PyArray2<u8>>(python)?.readonly();
+                                        let array = array_bound.as_array();
+                                        let array_dim = array.dim();
+                                        if array_dim.1 > dimensions.0 as usize {
+                                            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                                                "the frame width ({}) cannot be larger than the sensor width ({})",
+                                                array.dim().1,
+                                                dimensions.0
+                                            )));
+                                        }
+                                        if array_dim.0 > dimensions.1 as usize {
+                                            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                                                "the frame height ({}) cannot be larger than the sensor height ({})",
+                                                array.dim().0,
+                                                dimensions.1
+                                            )));
+                                        }
+                                        self.frame_buffer.reserve(array.len());
+                                        for row in array.rows() {
+                                            self.frame_buffer.extend(row.iter());
+                                        }
+                                        (encoder::Format::L, (array_dim.1, array_dim.0))
+                                    },
+                                    "RGB" | "RGBA" => {
+                                        let array_bound = frame.pixels.downcast_bound::<numpy::PyArray3<u8>>(python)?.readonly();
+                                        let array = array_bound.as_array();
+                                        let array_dim = array.dim();
+                                        if array_dim.1 > dimensions.0 as usize {
+                                            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                                                "the frame width ({}) cannot be larger than the sensor width ({})",
+                                                array.dim().1,
+                                                dimensions.0
+                                            )));
+                                        }
+                                        if array_dim.0 > dimensions.1 as usize {
+                                            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                                                "the frame height ({}) cannot be larger than the sensor height ({})",
+                                                array.dim().0,
+                                                dimensions.1
+                                            )));
+                                        }
+                                        if frame.format.as_str() == "RGB" {
+                                            if array_dim.2 != 3 {
+                                                return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                                                    "the frame must have 3 channels (got {})",
+                                                    array.dim().2,
+                                                )));
+                                            }
+                                            self.frame_buffer.reserve(array.len());
+                                            for subview in array.outer_iter() {
+                                                for pixel in subview.rows() {
+                                                    self.frame_buffer.extend(&[
+                                                        pixel[2],
+                                                        pixel[0],
+                                                        pixel[1]
+                                                    ])
+                                                }
+                                            }
+                                            (encoder::Format::Bgr, (array_dim.1, array_dim.0))
+                                        } else {
+                                            if array_dim.2 != 4 {
+                                                return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                                                    "the frame must have 4 channels (got {})",
+                                                    array.dim().2,
+                                                )));
+                                            }
+                                            self.frame_buffer.reserve(array.len());
+                                            for subview in array.outer_iter() {
+                                                for pixel in subview.rows() {
+                                                    self.frame_buffer.extend(&[
+                                                        pixel[2],
+                                                        pixel[0],
+                                                        pixel[1],
+                                                        pixel[3],
+                                                    ])
+                                                }
+                                            }
+                                            (encoder::Format::Bgra, (array_dim.1, array_dim.0))
+                                        }
+                                    },
+                                    frame_format => return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                                        "unknown format \"{frame_format}\" (expected \"L\", \"RGB\", or \"RGBA\")"
+                                    ))),
+                                };
+                                *previous_t = frame.t;
+                                encoder.write_frame(
+                                    track_id,
+                                    frame.t,
+                                    frame.begin_t,
+                                    frame.end_t,
+                                    frame.exposure_begin_t,
+                                    frame.exposure_end_t,
+                                    frame_format,
+                                    frame_dimensions.0 as i16,
+                                    frame_dimensions.1 as i16,
+                                    frame.offset_x,
+                                    frame.offset_y,
+                                    &self.frame_buffer,
+                                )?;
+                            }
+                            common::Track::Imus { ref mut previous_t } => {
+                                let (array, length) =
+                                    types::check_array(python, types::ArrayType::AedatImu, packet)?;
+                                unsafe {
+                                    for index in 0..length {
+                                        let imu_cell: *mut encoder::Imu =
+                                            types::array_at(python, array, index);
+                                        let imu = *imu_cell;
+                                        if imu.t < *previous_t {
+                                            return Err(utilities::WriteError::NonMonotonic {
+                                                previous_t: *previous_t,
+                                                t: imu.t,
+                                            }
+                                            .into());
+                                        }
+                                        *previous_t = imu.t;
+                                    }
+                                }
+                                encoder.write_imus(
+                                    track_id,
+                                    (0..length).into_iter().map(|index| unsafe {
+                                        *types::array_at(python, array, index)
+                                    }),
+                                )?;
+                            }
+                            common::Track::Triggers { ref mut previous_t } => {
+                                let (array, length) = types::check_array(
+                                    python,
+                                    types::ArrayType::AedatTrigger,
+                                    packet,
+                                )?;
+                                unsafe {
+                                    for index in 0..length {
+                                        let trigger_cell: *mut encoder::Trigger =
+                                            types::array_at(python, array, index);
+                                        let trigger = *trigger_cell;
+                                        if trigger.t < *previous_t {
+                                            return Err(utilities::WriteError::NonMonotonic {
+                                                previous_t: *previous_t,
+                                                t: trigger.t,
+                                            }
+                                            .into());
+                                        }
+                                        if trigger.source >= 128 {
+                                            return Err(utilities::WriteError::TriggerOverflow {
+                                                id: trigger.source,
+                                                maximum: 128,
+                                            }
+                                            .into());
+                                        }
+                                        *previous_t = trigger.t;
+                                    }
+                                }
+                                encoder.write_triggers(
+                                    track_id,
+                                    (0..length).into_iter().map(|index| unsafe {
+                                        *types::array_at(python, array, index)
+                                    }),
+                                )?;
+                            }
+                        }
+                        Ok(())
+                    }
+                    None => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                        "unknown track ID {track_id}"
+                    ))),
+                },
+                None => Err(pyo3::exceptions::PyException::new_err(
+                    "write called after __exit__",
+                )),
+            }
         })
     }
 }

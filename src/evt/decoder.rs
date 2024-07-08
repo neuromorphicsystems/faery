@@ -1,24 +1,8 @@
 use std::io::Read;
 use std::io::Seek;
 
+use crate::evt::common;
 use crate::utilities;
-
-pub enum Version {
-    Evt2,
-    Evt21,
-    Evt3,
-}
-
-impl Version {
-    pub fn from_string(string: &str) -> Result<Version, Error> {
-        match string {
-            "EVT2" => Ok(Version::Evt2),
-            "EVT2.1" => Ok(Version::Evt21),
-            "EVT3" => Ok(Version::Evt3),
-            string => Err(Error::UnknownVersion(string.to_owned())),
-        }
-    }
-}
 
 enum State {
     Evt2 {
@@ -26,6 +10,7 @@ enum State {
         t_high: u64,
         t_offset: u64,
         t_without_offset: u64,
+        t0: u64,
     },
     Evt21 {},
     Evt3 {
@@ -35,12 +20,12 @@ enum State {
         previous_lsb_t: u16,
         x: u16,
         y: u16,
+        t0: u64,
     },
 }
 
 pub struct Decoder {
-    pub width: u16,
-    pub height: u16,
+    pub dimensions: (u16, u16),
     file: std::fs::File,
     raw_buffer: Vec<u8>,
     event_buffer: Vec<neuromorphic_types::DvsEvent<u64, u16, u16>>,
@@ -54,31 +39,34 @@ pub enum Error {
     #[error(transparent)]
     Io(#[from] std::io::Error),
 
+    #[error(transparent)]
+    Version(#[from] common::Error),
+
     #[error(
         "the header has no size information (width and height) and no size fallback was provided"
     )]
     MissingSize,
 
-    #[error("the header has no version information (EVT2, EVT2.1, or EVT3) and no versions fallback was provided")]
+    #[error("the header has no version information and no versions fallback was provided")]
     MissingVersion,
 
-    #[error("unknown version \"{0}\" (supports \"EVT2\", \"EVT2.1\", or \"EVT3\")")]
+    #[error("unknown version \"{0}\" (supports \"evt2\", \"evt2.1\", and \"evt3\")")]
     UnknownVersion(String),
 }
 
 impl Decoder {
     pub fn new<P: AsRef<std::path::Path>>(
         path: P,
-        size_fallback: Option<(u16, u16)>,
-        version_fallback: Option<Version>,
+        dimensions_fallback: Option<(u16, u16)>,
+        version_fallback: Option<common::Version>,
     ) -> Result<Self, Error> {
-        let header = utilities::read_header(
+        let header = utilities::read_prophesee_header(
             &mut std::io::BufReader::new(std::fs::File::open(&path)?),
             '%',
         )?;
-        let size = match header.size {
-            Some(size) => size,
-            None => match size_fallback {
+        let dimensions = match header.dimensions {
+            Some(dimensions) => dimensions,
+            None => match dimensions_fallback {
                 Some(size) => size,
                 None => return Err(Error::MissingSize),
             },
@@ -87,9 +75,9 @@ impl Decoder {
         file.seek(std::io::SeekFrom::Start(header.length))?;
         let version = match header.version {
             Some(version) => match version.as_str() {
-                "2" => Version::Evt2,
-                "2.1" => Version::Evt21,
-                "3" => Version::Evt3,
+                "2" => common::Version::Evt2,
+                "2.1" => common::Version::Evt21,
+                "3" => common::Version::Evt3,
                 _ => return Err(Error::UnknownVersion(version)),
             },
             None => match version_fallback {
@@ -98,47 +86,43 @@ impl Decoder {
             },
         };
         Ok(Decoder {
-            width: size.0,
-            height: size.1,
+            dimensions,
             file,
             raw_buffer: vec![0u8; utilities::BUFFER_SIZE],
             event_buffer: Vec::new(),
             trigger_buffer: Vec::new(),
             state: match version {
-                Version::Evt2 => State::Evt2 {
+                common::Version::Evt2 => State::Evt2 {
                     t: 0,
                     t_high: 0,
                     t_offset: 0,
                     t_without_offset: 0,
+                    t0: header.t0,
                 },
-                Version::Evt21 => State::Evt21 {},
-                Version::Evt3 => State::Evt3 {
+                common::Version::Evt21 => State::Evt21 {},
+                common::Version::Evt3 => State::Evt3 {
                     t: 0,
                     overflows: 0,
                     previous_msb_t: 0,
                     previous_lsb_t: 0,
                     x: 0,
                     y: 0,
+                    t0: header.t0,
                 },
             },
             polarity: neuromorphic_types::DvsPolarity::Off,
         })
     }
-}
 
-#[derive(thiserror::Error, Debug)]
-pub enum PacketError {
-    #[error(transparent)]
-    Io(#[from] std::io::Error),
+    pub fn version(&self) -> common::Version {
+        match self.state {
+            State::Evt2 { .. } => common::Version::Evt2,
+            State::Evt21 { .. } => common::Version::Evt21,
+            State::Evt3 { .. } => common::Version::Evt3,
+        }
+    }
 
-    #[error("x overflow (x={x} should be strictly smaller than width={width})")]
-    XOverflow { x: u16, width: u16 },
-
-    #[error("y overflow (y={y} should be strictly smaller than height={height})")]
-    YOverflow { y: u16, height: u16 },
-}
-
-impl Decoder {
+    #[allow(clippy::type_complexity)]
     pub fn next(
         &mut self,
     ) -> Result<
@@ -146,7 +130,7 @@ impl Decoder {
             &Vec<neuromorphic_types::DvsEvent<u64, u16, u16>>,
             &Vec<neuromorphic_types::TriggerEvent<u64, u8>>,
         )>,
-        PacketError,
+        utilities::ReadError,
     > {
         let read = self.file.read(&mut self.raw_buffer)?;
         if read == 0 {
@@ -160,36 +144,35 @@ impl Decoder {
                 ref mut t_high,
                 ref mut t_offset,
                 ref mut t_without_offset,
+                t0,
             } => {
                 for index in 0..read / 4 {
-                    let word = u32::from_le_bytes([
-                        self.raw_buffer[index * 4],
-                        self.raw_buffer[index * 4 + 1],
-                        self.raw_buffer[index * 4 + 2],
-                        self.raw_buffer[index * 4 + 3],
-                    ]);
-
+                    let word = u32::from_le_bytes(
+                        self.raw_buffer[index * 4..(index + 1) * 4]
+                            .try_into()
+                            .expect("4 bytes"),
+                    );
                     match word >> 28 {
                         0b0000 | 0b0001 => {
                             *t = (*t_high
                                 + ((word & 0b1111110000000000000000000000_u32) >> 22) as u64)
                                 .max(*t);
-                            let x = ((word & 0b1111111111100000000000_u32) >> 11)  as u16;
-                            if x >= self.width {
-                                return Err(PacketError::XOverflow {
+                            let x = ((word & 0b1111111111100000000000_u32) >> 11) as u16;
+                            if x >= self.dimensions.0 {
+                                return Err(utilities::ReadError::XOverflow {
                                     x,
-                                    width: self.width,
+                                    width: self.dimensions.0,
                                 });
                             }
                             let y = (word & 0b0000000000011111111111_u32) as u16;
-                            if y >= self.height {
-                                return Err(PacketError::YOverflow {
+                            if y >= self.dimensions.1 {
+                                return Err(utilities::ReadError::YOverflow {
                                     y,
-                                    height: self.height,
+                                    height: self.dimensions.1,
                                 });
                             }
                             self.event_buffer.push(neuromorphic_types::DvsEvent {
-                                t: *t,
+                                t: *t + t0,
                                 x,
                                 y,
                                 polarity: if (word >> 28) & 0b1 > 0 {
@@ -200,12 +183,11 @@ impl Decoder {
                             });
                         }
                         0b1000 => {
-                            let candidate_t_without_offset =
-                                ((word & 0b1111111111111111111111111111_u32) as u64) << 6;
-                            if candidate_t_without_offset < *t_without_offset {
+                            let new_t_without_offset = ((word & 0xFFFFFFF_u32) as u64) << 6;
+                            if new_t_without_offset < *t_without_offset {
                                 *t_offset += 1u64 << 34;
                             }
-                            *t_without_offset = candidate_t_without_offset;
+                            *t_without_offset = new_t_without_offset;
                             *t_high = *t_without_offset + *t_offset;
                         }
                         0b1010 => {
@@ -213,7 +195,7 @@ impl Decoder {
                                 + ((word & 0b1111110000000000000000000000_u32) >> 22) as u64)
                                 .max(*t);
                             self.trigger_buffer.push(neuromorphic_types::TriggerEvent {
-                                t: *t,
+                                t: *t + t0,
                                 id: ((word & 0b1111100000000) >> 8) as u8,
                                 polarity: if (word & 1) > 0 {
                                     neuromorphic_types::TriggerPolarity::Rising
@@ -228,7 +210,9 @@ impl Decoder {
                     }
                 }
             }
-            State::Evt21 {} => {}
+            State::Evt21 {} => {
+                todo!("implement EVT2.1 (example / test data needed)");
+            }
             State::Evt3 {
                 ref mut t,
                 ref mut overflows,
@@ -236,6 +220,7 @@ impl Decoder {
                 ref mut previous_lsb_t,
                 ref mut x,
                 ref mut y,
+                t0,
             } => {
                 for index in 0..read / 2 {
                     let word = u16::from_le_bytes([
@@ -245,24 +230,24 @@ impl Decoder {
                     match word >> 12 {
                         0b0000 => {
                             let candidate_y = word & 0b11111111111;
-                            if candidate_y < self.height {
+                            if candidate_y < self.dimensions.1 {
                                 *y = candidate_y;
                             } else {
-                                return Err(PacketError::YOverflow {
+                                return Err(utilities::ReadError::YOverflow {
                                     y: candidate_y,
-                                    height: self.height,
+                                    height: self.dimensions.1,
                                 });
                             }
                         }
                         0b0001 => (),
                         0b0010 => {
                             let candidate_x = word & 0b11111111111;
-                            if candidate_x < self.width {
+                            if candidate_x < self.dimensions.0 {
                                 *x = candidate_x;
                             } else {
-                                return Err(PacketError::XOverflow {
+                                return Err(utilities::ReadError::XOverflow {
                                     x: candidate_x,
-                                    width: self.width,
+                                    width: self.dimensions.0,
                                 });
                             }
                             self.polarity = if (word & (1 << 11)) > 0 {
@@ -271,7 +256,7 @@ impl Decoder {
                                 neuromorphic_types::DvsPolarity::Off
                             };
                             self.event_buffer.push(neuromorphic_types::DvsEvent {
-                                t: *t,
+                                t: *t + t0,
                                 x: *x,
                                 y: *y,
                                 polarity: self.polarity,
@@ -279,12 +264,12 @@ impl Decoder {
                         }
                         0b0011 => {
                             let candidate_x = word & 0b11111111111;
-                            if candidate_x < self.width {
+                            if candidate_x < self.dimensions.0 {
                                 *x = candidate_x;
                             } else {
-                                return Err(PacketError::XOverflow {
+                                return Err(utilities::ReadError::XOverflow {
                                     x: candidate_x,
-                                    width: self.width,
+                                    width: self.dimensions.0,
                                 });
                             }
                             self.polarity = if (word & (1 << 11)) > 0 {
@@ -294,32 +279,32 @@ impl Decoder {
                             };
                         }
                         0b0100 => {
-                            let set = word & ((1 << std::cmp::min(12, self.width - *x)) - 1);
+                            let set = word & ((1 << std::cmp::min(12, self.dimensions.0 - *x)) - 1);
                             for bit in 0..12 {
                                 if (set & (1 << bit)) > 0 {
                                     self.event_buffer.push(neuromorphic_types::DvsEvent {
-                                        t: *t,
+                                        t: *t + t0,
                                         x: *x + bit,
                                         y: *y,
                                         polarity: self.polarity,
                                     });
                                 }
                             }
-                            *x = (*x + 12).min(self.width - 1);
+                            *x = (*x + 12).min(self.dimensions.0 - 1);
                         }
                         0b0101 => {
-                            let set = word & ((1 << std::cmp::min(8, self.width - *x)) - 1);
+                            let set = word & ((1 << std::cmp::min(8, self.dimensions.0 - *x)) - 1);
                             for bit in 0..8 {
                                 if (set & (1 << bit)) > 0 {
                                     self.event_buffer.push(neuromorphic_types::DvsEvent {
-                                        t: *t,
+                                        t: *t + t0,
                                         x: *x + bit,
                                         y: *y,
                                         polarity: self.polarity,
                                     });
                                 }
                             }
-                            *x = (*x + 8).min(self.width - 1);
+                            *x = (*x + 8).min(self.dimensions.0 - 1);
                         }
                         0b0110 => {
                             let lsb_t = word & 0b111111111111;
@@ -359,7 +344,7 @@ impl Decoder {
                         }
                         0b1001 => (),
                         0b1010 => self.trigger_buffer.push(neuromorphic_types::TriggerEvent {
-                            t: *t,
+                            t: *t + t0,
                             id: ((word >> 8) & 0b1111) as u8,
                             polarity: if (word & 1) > 0 {
                                 neuromorphic_types::TriggerPolarity::Rising

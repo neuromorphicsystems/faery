@@ -2,3 +2,4 @@ target
 *.so
 .venv
 __pycache__
+tests/data_generated

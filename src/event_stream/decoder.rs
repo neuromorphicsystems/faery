@@ -1,35 +1,7 @@
 use std::io::Read;
 
+use crate::event_stream::common;
 use crate::utilities;
-
-const MAGIC_NUMBER: &str = "Event Stream";
-const VERSION: [u8; 3] = [2, 0, 0];
-
-#[repr(u8)]
-#[derive(Debug, Clone, Copy)]
-pub enum Type {
-    Generic = 0,
-    Dvs = 1,
-    Atis = 2,
-    Color = 4,
-}
-
-#[repr(C)]
-pub struct GenericEvent {
-    pub t: u64,
-    pub bytes: Vec<u8>,
-}
-
-#[repr(C, packed)]
-#[derive(Debug, Copy, Clone)]
-pub struct ColorEvent {
-    pub t: u64,
-    pub x: u16,
-    pub y: u16,
-    pub r: u8,
-    pub g: u8,
-    pub b: u8,
-}
 
 enum GenericState {
     Idle,
@@ -71,36 +43,31 @@ enum State {
         index: usize,
         bytes_length: usize,
         bytes: Vec<u8>,
-        buffer: Vec<GenericEvent>,
+        buffer: Vec<common::OwnedGenericEvent>,
     },
     Dvs {
         inner: DvsState,
         event: neuromorphic_types::DvsEvent<u64, u16, u16>,
         buffer: Vec<neuromorphic_types::DvsEvent<u64, u16, u16>>,
-        width: u16,
-        height: u16,
+        dimensions: (u16, u16),
     },
     Atis {
         inner: AtisState,
         event: neuromorphic_types::AtisEvent<u64, u16, u16>,
         buffer: Vec<neuromorphic_types::AtisEvent<u64, u16, u16>>,
-        width: u16,
-        height: u16,
+        dimensions: (u16, u16),
     },
     Color {
         inner: ColorState,
-        event: ColorEvent,
-        buffer: Vec<ColorEvent>,
-        width: u16,
-        height: u16,
+        event: common::ColorEvent,
+        buffer: Vec<common::ColorEvent>,
+        dimensions: (u16, u16),
     },
 }
 
 pub struct Decoder {
     pub version: [u8; 3],
-    pub event_type: Type,
-    pub width: Option<u16>,
-    pub height: Option<u16>,
+    pub event_type: common::Type,
     file: std::fs::File,
     raw_buffer: Vec<u8>,
     state: State,
@@ -122,19 +89,19 @@ pub enum Error {
 }
 
 impl Decoder {
-    pub fn new<P: AsRef<std::path::Path>>(path: P) -> Result<Self, Error> {
+    pub fn new<P: AsRef<std::path::Path>>(path: P, t0: u64) -> Result<Self, Error> {
         let mut file = std::fs::File::open(path)?;
         {
-            let mut magic_number_bytes = [0u8; MAGIC_NUMBER.len()];
+            let mut magic_number_bytes = [0u8; common::MAGIC_NUMBER.len()];
             file.read_exact(&mut magic_number_bytes)?;
             let magic_number = String::from_utf8_lossy(&magic_number_bytes);
-            if magic_number != MAGIC_NUMBER {
+            if magic_number != common::MAGIC_NUMBER {
                 return Err(Error::MagicNumber(magic_number.to_string()));
             }
         }
         let mut version = [0u8; 3];
         file.read_exact(&mut version)?;
-        if version[0] != VERSION[0] {
+        if version[0] != common::VERSION[0] {
             return Err(Error::UnsupportedVersion {
                 major: version[0],
                 minor: version[1],
@@ -145,68 +112,64 @@ impl Decoder {
             let mut version_byte = [0u8; 1];
             file.read_exact(&mut version_byte)?;
             match version_byte[0] {
-                0 => Type::Generic,
-                1 => Type::Dvs,
-                2 => Type::Atis,
-                4 => Type::Color,
+                0 => common::Type::Generic,
+                1 => common::Type::Dvs,
+                2 => common::Type::Atis,
+                4 => common::Type::Color,
                 _ => return Err(Error::UnsupportedType(version_byte[0])),
             }
         };
-        let (width, height) = match event_type {
-            Type::Generic => (None, None),
+        let dimensions = match event_type {
+            common::Type::Generic => None,
             _ => {
                 let mut size_bytes = [0u8; 4];
                 file.read_exact(&mut size_bytes)?;
-                (
-                    Some(u16::from_le_bytes([size_bytes[0], size_bytes[1]])),
-                    Some(u16::from_le_bytes([size_bytes[2], size_bytes[3]])),
-                )
+                Some((
+                    u16::from_le_bytes([size_bytes[0], size_bytes[1]]),
+                    u16::from_le_bytes([size_bytes[2], size_bytes[3]]),
+                ))
             }
         };
         Ok(Decoder {
-            version: [0u8; 3],
+            version,
             event_type,
-            width,
-            height,
             file,
             raw_buffer: vec![0u8; utilities::BUFFER_SIZE],
             state: match event_type {
-                Type::Generic => State::Generic {
+                common::Type::Generic => State::Generic {
                     inner: GenericState::Idle,
-                    t: 0,
+                    t: t0,
                     index: 0,
                     bytes_length: 0,
                     bytes: Vec::new(),
                     buffer: Vec::new(),
                 },
-                Type::Dvs => State::Dvs {
+                common::Type::Dvs => State::Dvs {
                     inner: DvsState::Idle,
                     event: neuromorphic_types::DvsEvent::<u64, u16, u16> {
-                        t: 0,
+                        t: t0,
                         x: 0,
                         y: 0,
                         polarity: neuromorphic_types::DvsPolarity::Off,
                     },
                     buffer: Vec::new(),
-                    width: width.expect("a DVS stream has a width"),
-                    height: height.expect("a DVS stream has a height"),
+                    dimensions: dimensions.expect("a dvs stream has dimensions"),
                 },
-                Type::Atis => State::Atis {
+                common::Type::Atis => State::Atis {
                     inner: AtisState::Idle,
                     event: neuromorphic_types::AtisEvent::<u64, u16, u16> {
-                        t: 0,
+                        t: t0,
                         x: 0,
                         y: 0,
                         polarity: neuromorphic_types::AtisPolarity::Off,
                     },
                     buffer: Vec::new(),
-                    width: width.expect("an ATIS stream has a width"),
-                    height: height.expect("an ATIS stream has a height"),
+                    dimensions: dimensions.expect("a atis stream has dimensions"),
                 },
-                Type::Color => State::Color {
+                common::Type::Color => State::Color {
                     inner: ColorState::Idle,
-                    event: ColorEvent {
-                        t: 0,
+                    event: common::ColorEvent {
+                        t: t0,
                         x: 0,
                         y: 0,
                         r: 0,
@@ -214,35 +177,35 @@ impl Decoder {
                         b: 0,
                     },
                     buffer: Vec::new(),
-                    width: width.expect("a color stream has a width"),
-                    height: height.expect("a color stream has a height"),
+                    dimensions: dimensions.expect("a color stream has dimensions"),
                 },
             },
         })
     }
+
+    pub fn version(&self) -> [u8; 3] {
+        self.version.clone()
+    }
+
+    pub fn dimensions(&self) -> Option<(u16, u16)> {
+        match self.state {
+            State::Generic { .. } => None,
+            State::Dvs { dimensions, .. } => Some(dimensions),
+            State::Atis { dimensions, .. } => Some(dimensions),
+            State::Color { dimensions, .. } => Some(dimensions),
+        }
+    }
 }
 
 pub enum Packet<'a> {
-    Generic(&'a Vec<GenericEvent>),
+    Generic(&'a Vec<common::OwnedGenericEvent>),
     Dvs(&'a Vec<neuromorphic_types::DvsEvent<u64, u16, u16>>),
     Atis(&'a Vec<neuromorphic_types::AtisEvent<u64, u16, u16>>),
-    Color(&'a Vec<ColorEvent>),
-}
-
-#[derive(thiserror::Error, Debug)]
-pub enum PacketError {
-    #[error(transparent)]
-    Io(#[from] std::io::Error),
-
-    #[error("x overflow (x={x} should be strictly smaller than width={width})")]
-    XOverflow { x: u16, width: u16 },
-
-    #[error("y overflow (y={y} should be strictly smaller than height={height})")]
-    YOverflow { y: u16, height: u16 },
+    Color(&'a Vec<common::ColorEvent>),
 }
 
 impl Decoder {
-    pub fn next(&mut self) -> Result<Option<Packet>, PacketError> {
+    pub fn next(&mut self) -> Result<Option<Packet>, utilities::ReadError> {
         let read = self.file.read(&mut self.raw_buffer)?;
         if read == 0 {
             return Ok(None);
@@ -278,7 +241,7 @@ impl Decoder {
                                 bytes.clear();
                                 *index = 0;
                                 if *bytes_length == 0 {
-                                    buffer.push(GenericEvent {
+                                    buffer.push(common::OwnedGenericEvent {
                                         t: *t,
                                         bytes: bytes.clone(),
                                     });
@@ -296,7 +259,7 @@ impl Decoder {
                             bytes[*index] = *byte;
                             *index += 1;
                             if index == bytes_length {
-                                buffer.push(GenericEvent {
+                                buffer.push(common::OwnedGenericEvent {
                                     t: *t,
                                     bytes: bytes.clone(),
                                 });
@@ -313,8 +276,7 @@ impl Decoder {
                 ref mut inner,
                 ref mut event,
                 ref mut buffer,
-                width,
-                height,
+                dimensions,
             } => {
                 buffer.clear();
                 for byte in self.raw_buffer[0..read].iter() {
@@ -341,8 +303,11 @@ impl Decoder {
                         }
                         DvsState::Byte1 => {
                             event.x |= (*byte as u16) << 8;
-                            if event.x >= width {
-                                return Err(PacketError::XOverflow { x: event.x, width });
+                            if event.x >= dimensions.0 {
+                                return Err(utilities::ReadError::XOverflow {
+                                    x: event.x,
+                                    width: dimensions.0,
+                                });
                             }
                             DvsState::Byte2
                         }
@@ -352,8 +317,11 @@ impl Decoder {
                         }
                         DvsState::Byte3 => {
                             event.y |= (*byte as u16) << 8;
-                            if event.y >= height {
-                                return Err(PacketError::YOverflow { y: event.y, height });
+                            if event.y >= dimensions.1 {
+                                return Err(utilities::ReadError::YOverflow {
+                                    y: event.y,
+                                    height: dimensions.1,
+                                });
                             }
                             buffer.push(*event);
                             DvsState::Idle
@@ -366,8 +334,7 @@ impl Decoder {
                 ref mut inner,
                 ref mut event,
                 ref mut buffer,
-                width,
-                height,
+                dimensions,
             } => {
                 buffer.clear();
                 for byte in self.raw_buffer[0..read].iter() {
@@ -394,8 +361,11 @@ impl Decoder {
                         }
                         AtisState::Byte1 => {
                             event.x |= (*byte as u16) << 8;
-                            if event.x >= width {
-                                return Err(PacketError::XOverflow { x: event.x, width });
+                            if event.x >= dimensions.0 {
+                                return Err(utilities::ReadError::XOverflow {
+                                    x: event.x,
+                                    width: dimensions.0,
+                                });
                             }
                             AtisState::Byte2
                         }
@@ -405,8 +375,11 @@ impl Decoder {
                         }
                         AtisState::Byte3 => {
                             event.y |= (*byte as u16) << 8;
-                            if event.y >= height {
-                                return Err(PacketError::YOverflow { y: event.y, height });
+                            if event.y >= dimensions.1 {
+                                return Err(utilities::ReadError::YOverflow {
+                                    y: event.y,
+                                    height: dimensions.1,
+                                });
                             }
                             buffer.push(*event);
                             AtisState::Idle
@@ -419,8 +392,7 @@ impl Decoder {
                 ref mut inner,
                 ref mut event,
                 ref mut buffer,
-                width,
-                height,
+                dimensions,
             } => {
                 buffer.clear();
                 for byte in self.raw_buffer[0..read].iter() {
@@ -442,8 +414,11 @@ impl Decoder {
                         }
                         ColorState::Byte1 => {
                             event.x |= (*byte as u16) << 8;
-                            if event.x >= width {
-                                return Err(PacketError::XOverflow { x: event.x, width });
+                            if event.x >= dimensions.0 {
+                                return Err(utilities::ReadError::XOverflow {
+                                    x: event.x,
+                                    width: dimensions.0,
+                                });
                             }
                             ColorState::Byte2
                         }
@@ -453,8 +428,11 @@ impl Decoder {
                         }
                         ColorState::Byte3 => {
                             event.y |= (*byte as u16) << 8;
-                            if event.y >= height {
-                                return Err(PacketError::YOverflow { y: event.y, height });
+                            if event.y >= dimensions.1 {
+                                return Err(utilities::ReadError::YOverflow {
+                                    y: event.y,
+                                    height: dimensions.1,
+                                });
                             }
                             ColorState::Byte4
                         }

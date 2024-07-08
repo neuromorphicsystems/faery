@@ -1,65 +1,65 @@
-use pyo3::prelude::*;
 use std::io::BufRead;
 
 pub const BUFFER_SIZE: usize = 65536;
+pub const LZ4_MINIMUM_LEVEL: u8 = 1;
+pub const LZ4_DEFAULT_LEVEL: u8 = 1;
+pub const LZ4_MAXIMUM_LEVEL: u8 = 12;
+pub const ZSTD_MINIMUM_LEVEL: u8 = 1;
+pub const ZSTD_DEFAULT_LEVEL: u8 = zstd::DEFAULT_COMPRESSION_LEVEL as u8;
+pub const ZSTD_MAXIMUM_LEVEL: u8 = 22;
 
-pub unsafe fn set_dtype_as_list_field(
-    python: Python,
-    list: *mut pyo3::ffi::PyObject,
-    index: i32,
-    name: &str,
-    numpy_type: core::ffi::c_int,
-) {
-    let tuple = pyo3::ffi::PyTuple_New(2);
-    if pyo3::ffi::PyTuple_SetItem(
-        tuple,
-        0 as pyo3::ffi::Py_ssize_t,
-        pyo3::ffi::PyUnicode_FromStringAndSize(
-            name.as_ptr() as *const core::ffi::c_char,
-            name.len() as pyo3::ffi::Py_ssize_t,
-        ),
-    ) < 0
-    {
-        panic!("PyTuple_SetItem 0 failed");
-    }
-    if pyo3::ffi::PyTuple_SetItem(
-        tuple,
-        1 as pyo3::ffi::Py_ssize_t,
-        numpy::PY_ARRAY_API.PyArray_TypeObjectFromType(python, numpy_type),
-    ) < 0
-    {
-        panic!("PyTuple_SetItem 1 failed");
-    }
-    if pyo3::ffi::PyList_SetItem(list, index as pyo3::ffi::Py_ssize_t, tuple) < 0 {
-        panic!("PyList_SetItem failed");
+#[derive(thiserror::Error, Debug)]
+pub enum ReadError {
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+
+    #[error("x overflow (x={x} should be strictly smaller than width={width})")]
+    XOverflow { x: u16, width: u16 },
+
+    #[error("y overflow (y={y} should be strictly smaller than height={height})")]
+    YOverflow { y: u16, height: u16 },
+}
+
+impl From<ReadError> for pyo3::PyErr {
+    fn from(error: ReadError) -> Self {
+        pyo3::PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(error.to_string())
     }
 }
 
-pub fn python_path_to_string(python: Python, path: &pyo3::types::PyAny) -> PyResult<String> {
-    if let Ok(result) = path.downcast::<pyo3::types::PyString>() {
-        return Ok(result.to_string());
+#[derive(thiserror::Error, Debug)]
+pub enum WriteError {
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+
+    #[error(
+        "the event's timestamp ({t}) is smaller than the previous event's timestamp ({previous_t})"
+    )]
+    NonMonotonic { previous_t: u64, t: u64 },
+
+    #[error("x overflow (x={x} should be strictly smaller than width={width})")]
+    XOverflow { x: u16, width: u16 },
+
+    #[error("y overflow (y={y} should be strictly smaller than height={height})")]
+    YOverflow { y: u16, height: u16 },
+
+    #[error("trigger id overflow (id={id} should be strictly smaller than maximum={maximum})")]
+    TriggerOverflow { id: u8, maximum: u8 },
+}
+
+impl From<WriteError> for pyo3::PyErr {
+    fn from(error: WriteError) -> Self {
+        pyo3::PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(error.to_string())
     }
-    if let Ok(result) = path.downcast::<pyo3::types::PyBytes>() {
-        return Ok(result.to_string());
-    }
-    let fspath_result = path.to_object(python).call_method0(python, "__fspath__")?;
-    {
-        let fspath_as_string: PyResult<&pyo3::types::PyString> = fspath_result.extract(python);
-        if let Ok(result) = fspath_as_string {
-            return Ok(result.to_string());
-        }
-    }
-    let fspath_as_bytes: &pyo3::types::PyBytes = fspath_result.extract(python)?;
-    Ok(fspath_as_bytes.to_string())
 }
 
 pub struct Header {
-    pub size: Option<(u16, u16)>,
+    pub dimensions: Option<(u16, u16)>,
     pub version: Option<String>,
     pub length: u64,
+    pub t0: u64,
 }
 
-pub fn read_header(
+pub fn read_prophesee_header(
     file: &mut std::io::BufReader<std::fs::File>,
     marker: char,
 ) -> Result<Header, std::io::Error> {
@@ -67,6 +67,7 @@ pub fn read_header(
     let mut width: Option<u16> = None;
     let mut height: Option<u16> = None;
     let mut version: Option<String> = None;
+    let mut t0: Option<u64> = None;
     let mut length = 0;
     loop {
         buffer.clear();
@@ -83,13 +84,19 @@ pub fn read_header(
         length += bytes_read as u64;
         let words: Vec<&str> = buffer[1..]
             .trim()
-            .split(" ")
+            .split(&[' ', ';'])
             .map(|word| word.trim())
+            .filter(|word| !word.is_empty())
             .collect();
         if words.len() > 1 {
             match words[0] {
                 "Version" => {
-                    version = Some(words[1].to_lowercase());
+                    version = Some(match words[1] {
+                        "2" | "2.0" => "2".to_owned(),
+                        "2.1" => "2.1".to_owned(),
+                        "3" | "3.0" => "3".to_owned(),
+                        word => word.to_owned(),
+                    });
                 }
                 "Width" => {
                     if let Ok(width_candidate) = words[1].parse() {
@@ -102,7 +109,11 @@ pub fn read_header(
                     }
                 }
                 "geometry" => {
-                    let subwords: Vec<&str> = words[1].split("x").collect();
+                    let subwords: Vec<&str> = words[1]
+                        .split('x')
+                        .map(|subword| subword.trim())
+                        .filter(|subword| !subword.is_empty())
+                        .collect();
                     if subwords.len() == 2 {
                         if let Ok(width_candidate) = subwords[0].parse() {
                             if let Ok(height_candidate) = subwords[1].parse() {
@@ -112,6 +123,11 @@ pub fn read_header(
                         }
                     }
                 }
+                "T0" | "t0" => {
+                    if let Ok(t0_candidate) = words[1].parse() {
+                        t0 = Some(t0_candidate);
+                    }
+                }
                 "format" => {
                     version = Some(match words[1] {
                         "EVT2" | "evt2" | "EVT2.0" | "evt2.0" => "2".to_owned(),
@@ -119,6 +135,32 @@ pub fn read_header(
                         "EVT3" | "evt3" | "EVT3.0" | "evt3.0" => "3".to_owned(),
                         word => word.to_owned(),
                     });
+                    if words.len() == 4 {
+                        let mut format_width = None;
+                        let mut format_height = None;
+                        for word in words[2..4].iter() {
+                            let subwords: Vec<&str> = word
+                                .split('=')
+                                .map(|subword| subword.trim())
+                                .filter(|subword| !subword.is_empty())
+                                .collect();
+                            if subwords.len() == 2 {
+                                if subwords[0] == "width" {
+                                    if let Ok(width_candidate) = subwords[1].parse() {
+                                        format_width = Some(width_candidate);
+                                    }
+                                } else if subwords[0] == "height" {
+                                    if let Ok(height_candidate) = subwords[1].parse() {
+                                        format_height = Some(height_candidate);
+                                    }
+                                }
+                            }
+                        }
+                        if format_width.is_some() && format_height.is_some() {
+                            width = format_width;
+                            height = format_height;
+                        }
+                    }
                 }
                 "evt" => {
                     version = Some(match words[1] {
@@ -135,15 +177,17 @@ pub fn read_header(
     if let Some(width) = width {
         if let Some(height) = height {
             return Ok(Header {
-                size: Some((width, height)),
+                dimensions: Some((width, height)),
                 version,
                 length,
+                t0: t0.unwrap_or(0),
             });
         }
     }
     Ok(Header {
-        size: None,
+        dimensions: None,
         version,
         length,
+        t0: t0.unwrap_or(0),
     })
 }
