@@ -1,3 +1,5 @@
+Development moved to https://github.com/aestream/faery.
+
 ## Contribute
 
 Local build (first run).
